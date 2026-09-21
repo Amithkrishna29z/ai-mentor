@@ -1,0 +1,23 @@
+[package]
+name = "ai-mentor"
+version = "0.1.0"
+edition = "2021"
+description = "Mentors you through advanced tech topics using Josh Kaufman's 20-hour rule, powered by the Claude CLI."
+license = "MIT"
+
+[dependencies]
+eframe = "0.36"
+egui = "0.36"
+egui_commonmark = "0.25"
+egui_plot = "0.37"
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["clock"] }
+directories = "6"
+tempfile = "3"
+
+[profile.release]
+opt-level = 2
