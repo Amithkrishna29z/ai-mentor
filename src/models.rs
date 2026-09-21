@@ -162,15 +162,6 @@ pub struct QuizQuestion {
 }
 
 #[derive(Debug, Clone)]
-pub struct QuizAttempt {
-    pub id: i64,
-    pub quiz_id: i64,
-    pub score: i64,
-    pub total: i64,
-    pub attempted_at: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct ReviewCard {
     pub id: i64,
     pub source_type: String,

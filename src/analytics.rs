@@ -2,7 +2,7 @@
 //! heatmap grid and the weekly-minutes trend.
 
 use anyhow::Result;
-use chrono::{Datelike, Duration, NaiveDate, Weekday};
+use chrono::{Datelike, Duration, NaiveDate};
 use std::collections::BTreeMap;
 
 use crate::db::Db;
@@ -151,8 +151,4 @@ pub fn weekday_label(index: usize) -> &'static str {
 /// Month label for a heatmap column, shown when the month changes.
 pub fn month_label(date: NaiveDate) -> String {
     date.format("%b").to_string()
-}
-
-pub fn is_week_start(date: NaiveDate) -> bool {
-    date.weekday() == Weekday::Sun
 }

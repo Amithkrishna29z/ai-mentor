@@ -125,24 +125,6 @@ impl Db {
         Ok(rows)
     }
 
-    pub fn stack(&self, id: i64) -> Result<Option<TechStack>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT id, name, selected, is_custom FROM tech_stacks WHERE id = ?1",
-                params![id],
-                |r| {
-                    Ok(TechStack {
-                        id: r.get(0)?,
-                        name: r.get(1)?,
-                        selected: r.get::<_, i64>(2)? != 0,
-                        is_custom: r.get::<_, i64>(3)? != 0,
-                    })
-                },
-            )
-            .optional()?)
-    }
-
     pub fn stack_id_by_name(&self, name: &str) -> Result<Option<i64>> {
         Ok(self
             .conn
@@ -504,10 +486,6 @@ impl Db {
         Ok(rows)
     }
 
-    pub fn active_roadmap(&self) -> Result<Option<Roadmap>> {
-        Ok(self.roadmaps()?.into_iter().find(|r| r.active))
-    }
-
     pub fn set_active_roadmap(&self, id: i64) -> Result<()> {
         self.conn.execute("UPDATE roadmaps SET active = 0", [])?;
         self.conn
@@ -676,25 +654,6 @@ impl Db {
             params![quiz_id, score, total, answers_json, now()],
         )?;
         Ok(())
-    }
-
-    pub fn attempts_for_quiz(&self, quiz_id: i64) -> Result<Vec<QuizAttempt>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, quiz_id, score, total, attempted_at FROM quiz_attempts
-             WHERE quiz_id = ?1 ORDER BY id DESC",
-        )?;
-        let rows = stmt
-            .query_map(params![quiz_id], |r| {
-                Ok(QuizAttempt {
-                    id: r.get(0)?,
-                    quiz_id: r.get(1)?,
-                    score: r.get(2)?,
-                    total: r.get(3)?,
-                    attempted_at: r.get(4)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
     }
 
     /// Average quiz score as a percentage across every attempt.

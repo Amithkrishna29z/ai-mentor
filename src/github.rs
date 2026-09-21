@@ -136,26 +136,3 @@ pub fn gather_sources(root: &Path, cap_bytes: usize) -> Result<String> {
     }
     Ok(out)
 }
-
-/// Rough file/line census shown next to a verification run.
-pub fn count_sources(root: &Path) -> usize {
-    let mut count = 0;
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_string();
-            if path.is_dir() {
-                if !SKIP_DIRS.contains(&name.as_str()) {
-                    stack.push(path);
-                }
-            } else if is_source(&path) {
-                count += 1;
-            }
-        }
-    }
-    count
-}
