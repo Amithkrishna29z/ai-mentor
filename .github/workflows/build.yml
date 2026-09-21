@@ -32,6 +32,10 @@ jobs:
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
         run: |
+          # Runner images ship third-party apt repos (Microsoft, Chrome) that
+          # intermittently 403 and fail the whole update; none are needed here.
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+                     /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             libgl1-mesa-dev libwayland-dev libxkbcommon-dev pkg-config
