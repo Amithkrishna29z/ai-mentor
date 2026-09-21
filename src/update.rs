@@ -173,7 +173,13 @@ mod download_integration {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let archive = tmp.path().join(asset.name());
         let file = std::fs::File::create(&archive).expect("create archive");
+        // GitHub's asset URL serves release JSON unless the request asks for
+        // the binary; the real update path sets this header internally.
         self_update::Download::from_url(asset.download_url())
+            .request_header(
+                self_update::http_client::header::ACCEPT,
+                "application/octet-stream",
+            )
             .download_to(&file)
             .expect("download");
 
