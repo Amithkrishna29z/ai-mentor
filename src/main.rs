@@ -12,6 +12,7 @@ mod quiz;
 mod roadmap;
 mod srs;
 mod ui;
+mod update;
 mod verify;
 
 fn main() -> eframe::Result<()> {

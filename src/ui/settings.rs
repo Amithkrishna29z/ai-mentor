@@ -1,6 +1,7 @@
 //! Settings window: CLI/git paths, plan defaults, quiz and heatmap options.
 
 use crate::app::AiMentorApp;
+use crate::ui::theme;
 
 pub fn show(app: &mut AiMentorApp, ctx: &egui::Context) {
     let mut open = app.show_settings;
@@ -9,6 +10,8 @@ pub fn show(app: &mut AiMentorApp, ctx: &egui::Context) {
         .resizable(false)
         .default_width(430.0)
         .show(ctx, |ui| {
+            theme::section_label(ui, "Claude CLI & plan defaults");
+            ui.add_space(6.0);
             egui::Grid::new("settings_grid")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
@@ -77,17 +80,115 @@ pub fn show(app: &mut AiMentorApp, ctx: &egui::Context) {
                 );
             }
 
-            ui.add_space(8.0);
+            ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
+                let t = theme::current(ui);
+                let save = egui::Button::new(
+                    egui::RichText::new("Save").color(egui::Color32::WHITE).strong(),
+                )
+                .fill(t.accent)
+                .corner_radius(egui::CornerRadius::same(8));
+                if ui.add(save).clicked() {
                     app.apply_settings();
                 }
                 if ui.button("Test Claude CLI").clicked() {
                     test_cli(app);
                 }
             });
+
+            ui.add_space(14.0);
+            ui.separator();
+            ui.add_space(10.0);
+            updates_section(app, ui);
         });
     app.show_settings = open;
+}
+
+/// Version, update check and one-click install.
+fn updates_section(app: &mut AiMentorApp, ui: &mut egui::Ui) {
+    let t = theme::current(ui);
+    theme::section_label(ui, "Updates");
+    ui.add_space(6.0);
+
+    ui.horizontal(|ui| {
+        ui.label("Installed version");
+        theme::chip(ui, format!("v{}", crate::update::current_version()));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add_enabled(!app.checking_update, egui::Button::new("Check now"))
+                .clicked()
+            {
+                app.check_for_update();
+            }
+            if app.checking_update {
+                ui.spinner();
+            }
+        });
+    });
+
+    ui.add_space(6.0);
+    let mut on_start = app.db.setting_or("check_updates_on_start", "1") == "1";
+    if ui
+        .checkbox(&mut on_start, "Check for updates when the app starts")
+        .changed()
+    {
+        let _ = app
+            .db
+            .set_setting("check_updates_on_start", if on_start { "1" } else { "0" });
+    }
+
+    ui.add_space(8.0);
+    if let Some(version) = app.update_installed.clone() {
+        ui.horizontal(|ui| {
+            theme::pill(ui, "installed", t.good);
+            ui.label(format!("v{version} is in place \u{2014} restart to use it."));
+        });
+        return;
+    }
+
+    match app.update_available.clone() {
+        Some(release) => {
+            theme::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    theme::pill(ui, format!("v{}", release.version), t.good);
+                    ui.label(egui::RichText::new(&release.name).strong());
+                    ui.label(
+                        egui::RichText::new(&release.date).size(11.0).color(t.text_muted),
+                    );
+                });
+                if !release.notes.trim().is_empty() {
+                    ui.add_space(4.0);
+                    let notes: String = release.notes.lines().take(8).collect::<Vec<_>>().join("\n");
+                    ui.label(egui::RichText::new(notes).size(11.5).color(t.text_weak));
+                }
+                ui.add_space(8.0);
+                let install = egui::Button::new(
+                    egui::RichText::new("Download & install")
+                        .color(egui::Color32::WHITE)
+                        .strong(),
+                )
+                .fill(t.good)
+                .corner_radius(egui::CornerRadius::same(8));
+                if ui.add(install).clicked() {
+                    app.install_update();
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "The running app is replaced in place; the new version starts on the next launch.",
+                    )
+                    .size(11.0)
+                    .color(t.text_muted),
+                );
+            });
+        }
+        None => {
+            ui.label(
+                egui::RichText::new("No newer release found.")
+                    .size(11.5)
+                    .color(t.text_muted),
+            );
+        }
+    }
 }
 
 /// A cheap round-trip so a misconfigured path surfaces before a long job.

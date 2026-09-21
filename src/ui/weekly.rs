@@ -4,6 +4,7 @@ use egui_commonmark::CommonMarkViewer;
 
 use crate::app::AiMentorApp;
 use crate::models::{Issue, Verification};
+use crate::ui::theme;
 
 pub fn show(app: &mut AiMentorApp, ui: &mut egui::Ui) {
     if app.projects.is_empty() {
@@ -22,18 +23,30 @@ pub fn show(app: &mut AiMentorApp, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical()
         .id_salt("weekly_scroll")
         .show(ui, |ui| {
-            ui.heading(format!("Week {} — {}", project.week_number, project.title));
-            ui.label(&project.description);
+            let t = theme::current(ui);
+            theme::card(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Week {} \u{2014} {}",
+                        project.week_number, project.title
+                    ))
+                    .size(18.0)
+                    .strong(),
+                );
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(&project.description).color(t.text_weak));
 
-            if !project.acceptance.is_empty() {
-                ui.add_space(6.0);
-                ui.strong("Acceptance criteria");
-                for criterion in &project.acceptance {
-                    ui.label(format!("☐ {criterion}"));
+                if !project.acceptance.is_empty() {
+                    ui.add_space(10.0);
+                    theme::section_label(ui, "Acceptance criteria");
+                    ui.add_space(4.0);
+                    for criterion in &project.acceptance {
+                        ui.label(format!("\u{2610}  {criterion}"));
+                    }
                 }
-            }
+            });
 
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.label("Status:");
                 for option in ["not_started", "in_progress", "done"] {
@@ -97,23 +110,31 @@ fn week_picker(app: &mut AiMentorApp, ui: &mut egui::Ui) {
 }
 
 fn verify_panel(app: &mut AiMentorApp, ui: &mut egui::Ui, project: &crate::models::WeeklyProject) {
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.strong("Verify your build");
+    let t = theme::current(ui);
+    theme::card(ui, |ui| {
+        theme::section_label(ui, "Verify your build");
+        ui.add_space(4.0);
         ui.label(
             egui::RichText::new(
                 "Push the project to GitHub, then let the reviewer read the whole repo against \
                  this week's subskills. Requires git on PATH.",
             )
-            .small()
-            .weak(),
+            .size(11.5)
+            .color(t.text_muted),
         );
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut app.github_input)
                     .hint_text("https://github.com/you/your-project")
                     .desired_width(380.0),
             );
-            if ui.button("Verify").clicked() {
+            let verify = egui::Button::new(
+                egui::RichText::new("Verify").color(egui::Color32::WHITE).strong(),
+            )
+            .fill(t.accent)
+            .corner_radius(egui::CornerRadius::same(8));
+            if ui.add(verify).clicked() {
                 app.verify_project(project.id);
             }
             if ui.button("Save URL").clicked() {
@@ -136,15 +157,16 @@ fn results_panel(app: &mut AiMentorApp, ui: &mut egui::Ui) {
         return;
     }
 
+    let t = theme::current(ui);
     let latest = runs[0].clone();
     ui.horizontal(|ui| {
-        ui.strong("Latest review");
+        theme::section_label(ui, "Latest review");
+        theme::pill(ui, latest.verdict.replace('_', " "), verdict_color(&latest.verdict, &t));
         ui.label(
-            egui::RichText::new(format!(" {} ", latest.verdict))
-                .color(egui::Color32::WHITE)
-                .background_color(verdict_color(&latest.verdict)),
+            egui::RichText::new(format!("{}/100", latest.score))
+                .strong()
+                .size(15.0),
         );
-        ui.label(format!("score {}/100", latest.score));
         if !latest.commit_sha.is_empty() {
             ui.label(
                 egui::RichText::new(format!("@{}", &latest.commit_sha[..latest.commit_sha.len().min(8)]))
@@ -233,15 +255,11 @@ fn issue_list(app: &mut AiMentorApp, ui: &mut egui::Ui, issues: &[Issue]) {
         return;
     }
 
+    let t = theme::current(ui);
     for issue in filtered {
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        theme::card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(format!(" {} ", issue.severity))
-                        .small()
-                        .color(egui::Color32::WHITE)
-                        .background_color(severity_color(&issue.severity)),
-                );
+                theme::pill(ui, issue.severity.clone(), severity_color(&issue.severity, &t));
                 let location = match issue.line {
                     Some(line) if !issue.file.is_empty() => format!("{}:{}", issue.file, line),
                     _ => issue.file.clone(),
@@ -258,19 +276,21 @@ fn issue_list(app: &mut AiMentorApp, ui: &mut egui::Ui, issues: &[Issue]) {
     }
 }
 
-fn verdict_color(verdict: &str) -> egui::Color32 {
+/// Verdict and severity are state, so they use the reserved status palette -
+/// always beside their own label, never colour alone.
+fn verdict_color(verdict: &str, t: &theme::Theme) -> egui::Color32 {
     match verdict {
-        "pass" => egui::Color32::from_rgb(76, 160, 106),
-        "needs_work" => egui::Color32::from_rgb(214, 150, 60),
-        "fail" => egui::Color32::from_rgb(200, 70, 70),
-        _ => egui::Color32::from_gray(120),
+        "pass" => t.good,
+        "needs_work" => t.warning,
+        "fail" => t.critical,
+        _ => t.text_muted,
     }
 }
 
-fn severity_color(severity: &str) -> egui::Color32 {
+fn severity_color(severity: &str, t: &theme::Theme) -> egui::Color32 {
     match severity.to_ascii_lowercase().as_str() {
-        "high" => egui::Color32::from_rgb(200, 70, 70),
-        "med" | "medium" => egui::Color32::from_rgb(214, 150, 60),
-        _ => egui::Color32::from_rgb(110, 140, 180),
+        "high" => t.critical,
+        "med" | "medium" => t.serious,
+        _ => t.warning,
     }
 }

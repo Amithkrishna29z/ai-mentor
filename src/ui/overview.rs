@@ -1,7 +1,8 @@
 //! Study > Overview: subskills, the day grid, and 20-hour progress.
 
-use crate::app::{difficulty_color, status_color, AiMentorApp, StudyView};
+use crate::app::{status_color, AiMentorApp, StudyView};
 use crate::models::{DayStatus, PlanJson};
+use crate::ui::theme;
 
 pub fn show(app: &mut AiMentorApp, ui: &mut egui::Ui) {
     let Some(plan) = app.plan.clone() else {
@@ -18,27 +19,8 @@ pub fn show(app: &mut AiMentorApp, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical()
         .id_salt("overview_scroll")
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(app.active_stack_name());
-                ui.label(format!(
-                    "· {} days · {} min/day · {} h target",
-                    app.days.len(),
-                    plan.minutes_per_day,
-                    plan.target_hours
-                ));
-            });
-            ui.add_space(6.0);
-
-            ui.add(
-                egui::ProgressBar::new(fraction)
-                    .desired_height(16.0)
-                    .text(format!(
-                        "{:.1} / {} hours practised",
-                        logged as f32 / 60.0,
-                        plan.target_hours
-                    )),
-            );
-
+            let t = theme::current(ui);
+            let done = app.days.iter().filter(|d| d.status == DayStatus::Done).count();
             let reached = app
                 .days
                 .iter()
@@ -46,25 +28,54 @@ pub fn show(app: &mut AiMentorApp, ui: &mut egui::Ui) {
                 .map(|d| d.difficulty)
                 .max()
                 .unwrap_or(0);
-            ui.add(
-                egui::ProgressBar::new(reached as f32 / 5.0)
-                    .desired_height(12.0)
-                    .text(format!("highest difficulty completed: {reached}/5")),
-            );
+
+            theme::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(app.active_stack_name()).size(19.0).strong());
+                    ui.add_space(4.0);
+                    theme::chip(ui, format!("{} days", app.days.len()));
+                    theme::chip(ui, format!("{} min/day", plan.minutes_per_day));
+                    theme::chip(ui, format!("{} h target", plan.target_hours));
+                });
+                ui.add_space(10.0);
+                theme::meter(
+                    ui,
+                    "Practice toward the 20-hour goal",
+                    fraction,
+                    &format!("{:.1} / {} h", logged as f32 / 60.0, plan.target_hours),
+                );
+                ui.add_space(8.0);
+                theme::meter(
+                    ui,
+                    "Difficulty reached",
+                    reached as f32 / 5.0,
+                    &format!("{reached} / 5"),
+                );
+                ui.add_space(8.0);
+                theme::meter(
+                    ui,
+                    "Days completed",
+                    if app.days.is_empty() { 0.0 } else { done as f32 / app.days.len() as f32 },
+                    &format!("{done} / {}", app.days.len()),
+                );
+            });
 
             ui.add_space(10.0);
             subskills(app, ui, &plan);
             ui.add_space(10.0);
-            ui.strong("Days");
-            ui.label(
-                egui::RichText::new(
-                    "Difficulty never decreases: later days combine earlier subskills.",
-                )
-                .small()
-                .weak(),
-            );
-            ui.add_space(4.0);
-            day_grid(app, ui);
+
+            theme::card(ui, |ui| {
+                theme::section_label(ui, "Days");
+                ui.label(
+                    egui::RichText::new(
+                        "Difficulty never decreases \u{2014} later days combine earlier subskills.",
+                    )
+                    .size(11.5)
+                    .color(t.text_muted),
+                );
+                ui.add_space(8.0);
+                day_grid(app, ui);
+            });
         });
 }
 
@@ -73,72 +84,105 @@ fn subskills(app: &AiMentorApp, ui: &mut egui::Ui, plan: &crate::models::Plan) {
         .ok()
         .or_else(|| crate::mentor::extract_json(&plan.plan_json).and_then(|j| serde_json::from_str(j).ok()));
 
-    egui::CollapsingHeader::new("High-leverage subskills")
-        .default_open(true)
-        .show(ui, |ui| match parsed {
-            Some(p) if !p.subskills.is_empty() => {
-                let mut list = p.subskills;
-                list.sort_by_key(|s| s.priority);
-                for s in list {
-                    ui.horizontal_top(|ui| {
-                        ui.label(format!("{}.", s.priority));
-                        ui.vertical(|ui| {
-                            ui.strong(&s.name);
-                            if !s.why.is_empty() {
-                                ui.label(egui::RichText::new(&s.why).small().weak());
-                            }
-                        });
+    theme::titled_card(ui, "High-leverage subskills", |ui| match parsed {
+        Some(p) if !p.subskills.is_empty() => {
+            let t = theme::current(ui);
+            let mut list = p.subskills;
+            list.sort_by_key(|s| s.priority);
+            for s in list {
+                ui.horizontal_top(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{:02}", s.priority))
+                            .color(t.accent)
+                            .monospace(),
+                    );
+                    ui.vertical(|ui| {
+                        ui.label(egui::RichText::new(&s.name).strong());
+                        if !s.why.is_empty() {
+                            ui.label(egui::RichText::new(&s.why).size(11.5).color(t.text_weak));
+                        }
                     });
+                });
+                ui.add_space(4.0);
+            }
+        }
+        // Fall back to the distinct subskills recorded on the days.
+        _ => {
+            let mut seen: Vec<&str> = Vec::new();
+            for day in &app.days {
+                if !seen.contains(&day.subskill.as_str()) {
+                    seen.push(&day.subskill);
                 }
             }
-            // Fall back to the distinct subskills recorded on the days.
-            _ => {
-                let mut seen: Vec<&str> = Vec::new();
-                for day in &app.days {
-                    if !seen.contains(&day.subskill.as_str()) {
-                        seen.push(&day.subskill);
-                    }
-                }
-                for name in seen {
-                    ui.label(format!("• {name}"));
-                }
+            for name in seen {
+                ui.label(format!("\u{2022} {name}"));
             }
-        });
+        }
+    });
 }
 
 fn day_grid(app: &mut AiMentorApp, ui: &mut egui::Ui) {
     let days: Vec<_> = app.days.clone();
     let mut week = 0;
 
+    let t = theme::current(ui);
+
     for day in days {
         if day.week_number != week {
             week = day.week_number;
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new(format!("Week {week}")).strong());
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(format!("WEEK {week}"))
+                    .size(10.5)
+                    .color(t.text_muted)
+                    .strong(),
+            );
+            ui.add_space(2.0);
         }
-        ui.horizontal(|ui| {
-            let badge = egui::RichText::new(format!(" {} ", day.difficulty))
-                .color(egui::Color32::WHITE)
-                .background_color(difficulty_color(day.difficulty))
-                .monospace();
-            ui.label(badge);
-            ui.colored_label(status_color(day.status), "●")
-                .on_hover_text(day.status.label());
 
-            let selected = app.selected_day == Some(day.id);
-            let label = format!("Day {} — {}", day.day_number, day.title);
-            if ui.selectable_label(selected, label).clicked() {
-                app.selected_day = Some(day.id);
-                app.study_view = StudyView::Day;
-                app.sync_day_buffers();
-            }
+        let selected = app.selected_day == Some(day.id);
+        let fill = if selected { t.surface_alt } else { egui::Color32::TRANSPARENT };
+        let response = egui::Frame::new()
+            .fill(fill)
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(8, 5))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    theme::pill(
+                        ui,
+                        day.difficulty.to_string(),
+                        theme::difficulty_color(day.difficulty, t.dark),
+                    )
+                    .on_hover_text(format!("difficulty {}/5", day.difficulty));
+                    ui.colored_label(status_color(day.status, &t), "\u{25cf}")
+                        .on_hover_text(day.status.label());
+                    ui.label(
+                        egui::RichText::new(format!("Day {}", day.day_number))
+                            .color(t.text_muted)
+                            .size(12.0),
+                    );
+                    ui.label(egui::RichText::new(&day.title).color(t.text));
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if day.hands_on_done {
-                    ui.label(egui::RichText::new("hands-on ✔").small().weak());
-                }
-                ui.label(egui::RichText::new(format!("{} min", day.est_minutes)).small().weak());
-            });
-        });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{} min", day.est_minutes))
+                                .size(11.0)
+                                .color(t.text_muted),
+                        );
+                        if day.hands_on_done {
+                            ui.label(egui::RichText::new("\u{2714}").size(11.0).color(t.good))
+                                .on_hover_text("hands-on task done");
+                        }
+                    });
+                });
+            })
+            .response
+            .interact(egui::Sense::click());
+
+        if response.clicked() {
+            app.selected_day = Some(day.id);
+            app.study_view = StudyView::Day;
+            app.sync_day_buffers();
+        }
     }
 }

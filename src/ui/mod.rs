@@ -1,4 +1,5 @@
 pub mod analytics;
+pub mod theme;
 pub mod day_view;
 pub mod overview;
 pub mod quiz_window;

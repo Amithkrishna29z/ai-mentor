@@ -55,12 +55,34 @@ pub enum JobResult {
         report_md: String,
         outcome: Result<VerificationJson, String>,
     },
+    UpdateCheck {
+        outcome: std::result::Result<Option<crate::update::ReleaseInfo>, String>,
+    },
+    UpdateInstall {
+        outcome: std::result::Result<String, String>,
+    },
 }
+
+/// Spawn child processes without a console window.
+///
+/// The app is built with `windows_subsystem = "windows"`, so it owns no
+/// console; without this flag Windows allocates a fresh console window for
+/// every child, and a batch of plan generations flashes up a terminal each.
+#[cfg(windows)]
+pub fn hide_console(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+pub fn hide_console(_cmd: &mut Command) {}
 
 /// Run the CLI once and return stdout. `cwd` sets the working directory so
 /// Claude Code can read a cloned repository's files.
 pub fn run_cli(cfg: &CliConfig, prompt: &str, cwd: Option<&Path>) -> Result<String> {
     let mut cmd = Command::new(&cfg.claude_path);
+    hide_console(&mut cmd);
     cmd.arg(&cfg.prompt_flag).arg(prompt);
     for arg in cfg.extra_args.split_whitespace() {
         cmd.arg(arg);
@@ -514,6 +536,35 @@ mod cli_integration {
             plan.days.len(),
             difficulties,
             plan.weekly_projects.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    use super::*;
+
+    /// The no-console flag must not interfere with launching a child or
+    /// capturing its stdout.
+    #[test]
+    fn hidden_child_still_runs_and_its_output_is_captured() {
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.arg("/c").arg("echo").arg("hello");
+            c
+        } else {
+            let mut c = Command::new("echo");
+            c.arg("hello");
+            c
+        };
+        hide_console(&mut cmd);
+
+        let output = cmd.output().expect("child ran");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "hello",
+            "stdout is still captured with the console hidden"
         );
     }
 }

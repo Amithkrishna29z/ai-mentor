@@ -1,7 +1,7 @@
 //! Study tab: subject picker, view switcher, and manual plan-JSON repair.
 
 use crate::app::{AiMentorApp, StudyView};
-use crate::ui::{day_view, overview, weekly};
+use crate::ui::{day_view, overview, theme, weekly};
 
 pub fn show(app: &mut AiMentorApp, ui: &mut egui::Ui) {
     header(app, ui);
@@ -13,11 +13,7 @@ pub fn show(app: &mut AiMentorApp, ui: &mut egui::Ui) {
     }
 
     if app.plan.is_none() {
-        ui.add_space(24.0);
-        ui.vertical_centered(|ui| {
-            ui.label("No plan for this subject yet.");
-            ui.label("Tick it in the left panel, then press \"Generate plan for selected\".");
-        });
+        empty_state(app, ui);
         return;
     }
 
@@ -26,6 +22,57 @@ pub fn show(app: &mut AiMentorApp, ui: &mut egui::Ui) {
         StudyView::Day => day_view::show(app, ui),
         StudyView::Weekly => weekly::show(app, ui),
     }
+}
+
+/// Shown for a subject that has no generated plan yet.
+fn empty_state(app: &mut AiMentorApp, ui: &mut egui::Ui) {
+    let t = theme::current(ui);
+    let subject = app.active_stack_name();
+    ui.add_space(48.0);
+    ui.vertical_centered(|ui| {
+        ui.set_max_width(430.0);
+        theme::card(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!("No plan for {subject} yet"))
+                        .size(16.0)
+                        .strong(),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "A plan deconstructs the skill into its highest-leverage subskills and sequences them into day-by-day sessions that get harder as you go.",
+                    )
+                    .size(12.0)
+                    .color(t.text_weak),
+                );
+                ui.add_space(12.0);
+                let generate = egui::Button::new(
+                    egui::RichText::new(format!("Generate the {subject} plan"))
+                        .color(egui::Color32::WHITE)
+                        .strong(),
+                )
+                .fill(t.accent)
+                .corner_radius(egui::CornerRadius::same(8));
+                if ui.add(generate).clicked() {
+                    if let Some(stack_id) = app.active_stack {
+                        let _ = app.db.set_stack_selected(stack_id, true);
+                        app.reload_stacks();
+                        let tech = app.active_stack_name();
+                        app.regenerate_plan(stack_id, tech);
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("Needs the Claude CLI on your PATH.")
+                        .size(11.0)
+                        .color(t.text_muted),
+                );
+                ui.add_space(4.0);
+            });
+        });
+    });
 }
 
 fn header(app: &mut AiMentorApp, ui: &mut egui::Ui) {

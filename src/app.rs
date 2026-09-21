@@ -112,6 +112,12 @@ pub struct AiMentorApp {
     pub settings_form: SettingsForm,
 
     pub md_cache: CommonMarkCache,
+    /// A newer release found on GitHub, and the version installed this session.
+    pub dark_mode: bool,
+    pub theme_applied: bool,
+    pub update_available: Option<crate::update::ReleaseInfo>,
+    pub update_installed: Option<String>,
+    pub checking_update: bool,
     last_size_save: f64,
 }
 
@@ -137,6 +143,7 @@ impl AiMentorApp {
                 .setting_i64("roadmap_unlock_threshold", crate::roadmap::DEFAULT_UNLOCK_THRESHOLD),
         };
         let tab = Tab::parse(&db.setting_or("active_tab", "study"));
+        let dark_mode = db.setting_or("dark_mode", "1") == "1";
         let last_subject = db.get_setting("last_subject").and_then(|s| s.parse().ok());
         let stacks = db.all_stacks().unwrap_or_default();
 
@@ -176,10 +183,18 @@ impl AiMentorApp {
             show_settings: false,
             settings_form,
             md_cache: CommonMarkCache::default(),
+            dark_mode,
+            theme_applied: false,
+            update_available: None,
+            update_installed: None,
+            checking_update: false,
             last_size_save: 0.0,
         };
         app.reload_subject();
         app.reload_due_cards();
+        if app.db.setting_or("check_updates_on_start", "1") == "1" {
+            app.check_for_update();
+        }
         app
     }
 
@@ -594,8 +609,52 @@ impl AiMentorApp {
                     }
                     self.reload_verifications();
                 }
+                JobResult::UpdateCheck { outcome } => {
+                    self.checking_update = false;
+                    match outcome {
+                        Ok(Some(release)) => {
+                            self.status = format!("Version {} is available.", release.version);
+                            self.update_available = Some(release);
+                        }
+                        Ok(None) => {
+                            self.update_available = None;
+                            self.status =
+                                format!("AI Mentor {} is up to date.", crate::update::current_version());
+                        }
+                        Err(e) => self.error = Some(format!("Update check failed: {e}")),
+                    }
+                }
+                JobResult::UpdateInstall { outcome } => match outcome {
+                    Ok(version) => {
+                        self.update_available = None;
+                        self.update_installed = Some(version.clone());
+                        self.status =
+                            format!("Version {version} installed - restart to start using it.");
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("Update failed: {e}"));
+                        self.status = "The running version is untouched.".to_string();
+                    }
+                },
             }
         }
+    }
+
+    // -- updates -----------------------------------------------------------
+
+    pub fn check_for_update(&mut self) {
+        if self.checking_update {
+            return;
+        }
+        self.checking_update = true;
+        self.jobs_in_flight += 1;
+        crate::update::spawn_check(self.tx.clone());
+    }
+
+    pub fn install_update(&mut self) {
+        self.jobs_in_flight += 1;
+        self.status = "Downloading the new version…".to_string();
+        crate::update::spawn_install(self.tx.clone());
     }
 
     // -- settings ----------------------------------------------------------
@@ -649,88 +708,207 @@ impl eframe::App for AiMentorApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
         let ctx = &ctx;
+        if !self.theme_applied {
+            ui::theme::apply(ctx, self.dark_mode);
+            self.theme_applied = true;
+        }
         self.drain_jobs();
         if self.jobs_in_flight > 0 {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
         self.persist_window_size(ctx);
 
-        egui::Panel::top("top_bar").show(root, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("AI Mentor");
-                ui.separator();
-                let mut tab = self.tab;
-                ui.selectable_value(&mut tab, Tab::Study, "Study");
-                ui.selectable_value(&mut tab, Tab::Reviews, "Reviews");
-                ui.selectable_value(&mut tab, Tab::Analytics, "Analytics");
-                ui.selectable_value(&mut tab, Tab::Roadmap, "Roadmap");
-                if tab != self.tab {
-                    self.tab = tab;
-                    let _ = self.db.set_setting("active_tab", tab.key());
-                    if tab == Tab::Reviews {
-                        self.reload_due_cards();
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Settings").clicked() {
-                        self.show_settings = true;
-                    }
-                });
-            });
-        });
+        let t = ui::theme::theme_for(self.dark_mode);
 
-        egui::Panel::bottom("status_bar").show(root, |ui| {
-            ui.horizontal(|ui| {
-                if self.jobs_in_flight > 0 {
-                    ui.spinner();
-                    ui.label(format!("{} job(s) running", self.jobs_in_flight));
-                    ui.separator();
-                }
-                ui.label(&self.status);
-                if let Some(err) = self.error.clone() {
-                    ui.separator();
-                    ui.colored_label(egui::Color32::from_rgb(220, 90, 90), err);
-                    if ui.small_button("dismiss").clicked() {
-                        self.error = None;
-                    }
-                }
-            });
-        });
+        egui::Panel::top("top_bar")
+            .frame(
+                egui::Frame::new()
+                    .fill(t.surface)
+                    .inner_margin(egui::Margin::symmetric(14, 9))
+                    .stroke(egui::Stroke::new(1.0, t.border)),
+            )
+            .show(root, |ui| self.header(ui, &t));
+
+        egui::Panel::bottom("status_bar")
+            .frame(
+                egui::Frame::new()
+                    .fill(t.surface)
+                    .inner_margin(egui::Margin::symmetric(14, 6))
+                    .stroke(egui::Stroke::new(1.0, t.border)),
+            )
+            .show(root, |ui| self.status_bar(ui, &t));
 
         egui::Panel::left("subjects")
             .resizable(true)
-            .default_size(290.0)
+            .default_size(292.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(t.plane)
+                    .inner_margin(egui::Margin::symmetric(12, 10)),
+            )
             .show(root, |ui| {
                 ui::subjects::show(self, ui);
             });
 
-        egui::CentralPanel::default().show(root, |ui| match self.tab {
-            Tab::Study => ui::study::show(self, ui),
-            Tab::Reviews => ui::reviews::show(self, ui),
-            Tab::Analytics => ui::analytics::show(self, ui),
-            Tab::Roadmap => ui::roadmap::show(self, ui),
-        });
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(t.plane)
+                    .inner_margin(egui::Margin::symmetric(16, 12)),
+            )
+            .show(root, |ui| match self.tab {
+                Tab::Study => ui::study::show(self, ui),
+                Tab::Reviews => ui::reviews::show(self, ui),
+                Tab::Analytics => ui::analytics::show(self, ui),
+                Tab::Roadmap => ui::roadmap::show(self, ui),
+            });
 
         ui::settings::show(self, ctx);
         ui::quiz_window::show(self, ctx);
     }
 }
 
-/// Colour for a 1-5 difficulty badge.
-pub fn difficulty_color(difficulty: i64) -> egui::Color32 {
-    match difficulty {
-        1 => egui::Color32::from_rgb(76, 160, 106),
-        2 => egui::Color32::from_rgb(120, 160, 70),
-        3 => egui::Color32::from_rgb(196, 160, 60),
-        4 => egui::Color32::from_rgb(214, 120, 60),
-        _ => egui::Color32::from_rgb(200, 70, 70),
+impl AiMentorApp {
+    fn header(&mut self, ui: &mut egui::Ui, t: &ui::theme::Theme) {
+        ui.horizontal(|ui| {
+            let (mark, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+            ui.painter().rect_filled(
+                mark.shrink(1.0),
+                egui::CornerRadius::same(4),
+                t.accent,
+            );
+            ui.label(egui::RichText::new("AI Mentor").size(17.0).strong());
+            ui.add_space(10.0);
+            self.tab_bar(ui, t);
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let toggle = if self.dark_mode { "Light" } else { "Dark" };
+                if ui
+                    .button(egui::RichText::new(toggle).size(12.0))
+                    .on_hover_text("Switch theme")
+                    .clicked()
+                {
+                    self.dark_mode = !self.dark_mode;
+                    self.theme_applied = false;
+                    let _ = self
+                        .db
+                        .set_setting("dark_mode", if self.dark_mode { "1" } else { "0" });
+                }
+                if ui.button("Settings").clicked() {
+                    self.show_settings = true;
+                }
+                self.update_badge(ui, t);
+            });
+        });
+    }
+
+    /// Segmented control: one filled pill marks the active tab.
+    fn tab_bar(&mut self, ui: &mut egui::Ui, t: &ui::theme::Theme) {
+        egui::Frame::new()
+            .fill(t.surface_alt)
+            .corner_radius(egui::CornerRadius::same(9))
+            .inner_margin(egui::Margin::same(3))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 3.0;
+                    for (tab, label) in [
+                        (Tab::Study, "Study"),
+                        (Tab::Reviews, "Reviews"),
+                        (Tab::Analytics, "Analytics"),
+                        (Tab::Roadmap, "Roadmap"),
+                    ] {
+                        let selected = self.tab == tab;
+                        let text = if selected {
+                            egui::RichText::new(label).color(egui::Color32::WHITE).strong()
+                        } else {
+                            egui::RichText::new(label).color(t.text_weak)
+                        };
+                        let button = egui::Button::new(text)
+                            .fill(if selected {
+                                t.accent
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            })
+                            .stroke(egui::Stroke::NONE)
+                            .corner_radius(egui::CornerRadius::same(7));
+                        if ui.add(button).clicked() && !selected {
+                            self.tab = tab;
+                            let _ = self.db.set_setting("active_tab", tab.key());
+                            if tab == Tab::Reviews {
+                                self.reload_due_cards();
+                            }
+                        }
+                    }
+                });
+            });
+    }
+
+    /// "Update available" / "restart to finish" affordance in the header.
+    fn update_badge(&mut self, ui: &mut egui::Ui, t: &ui::theme::Theme) {
+        if let Some(version) = self.update_installed.clone() {
+            ui::theme::pill(ui, format!("v{version} ready \u{2014} restart"), t.good);
+            return;
+        }
+        if let Some(release) = self.update_available.clone() {
+            let button = egui::Button::new(
+                egui::RichText::new(format!("Update to {}", release.version))
+                    .color(egui::Color32::WHITE)
+                    .strong(),
+            )
+            .fill(t.good)
+            .corner_radius(egui::CornerRadius::same(8));
+            let hover = if release.notes.is_empty() {
+                release.name.clone()
+            } else {
+                release.notes.clone()
+            };
+            if ui.add(button).on_hover_text(hover).clicked() {
+                self.install_update();
+            }
+        }
+    }
+
+    fn status_bar(&mut self, ui: &mut egui::Ui, t: &ui::theme::Theme) {
+        ui.horizontal(|ui| {
+            if self.jobs_in_flight > 0 {
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new(format!("{} running", self.jobs_in_flight))
+                        .color(t.accent)
+                        .size(12.0),
+                );
+                ui.add_space(6.0);
+            }
+            ui.label(
+                egui::RichText::new(&self.status)
+                    .color(t.text_weak)
+                    .size(12.0),
+            );
+
+            if let Some(err) = self.error.clone() {
+                ui.add_space(6.0);
+                ui::theme::pill(ui, "error", t.critical);
+                ui.label(egui::RichText::new(err).color(t.critical).size(12.0));
+                if ui.small_button("dismiss").clicked() {
+                    self.error = None;
+                }
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(format!("v{}", crate::update::current_version()))
+                        .color(t.text_muted)
+                        .size(11.0),
+                );
+            });
+        });
     }
 }
 
-pub fn status_color(status: DayStatus) -> egui::Color32 {
+pub fn status_color(status: DayStatus, t: &ui::theme::Theme) -> egui::Color32 {
     match status {
-        DayStatus::NotStarted => egui::Color32::from_gray(120),
-        DayStatus::InProgress => egui::Color32::from_rgb(90, 150, 210),
-        DayStatus::Done => egui::Color32::from_rgb(76, 160, 106),
+        DayStatus::NotStarted => t.text_muted,
+        DayStatus::InProgress => t.accent,
+        DayStatus::Done => t.good,
     }
 }

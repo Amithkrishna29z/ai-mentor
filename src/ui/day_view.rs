@@ -2,8 +2,9 @@
 
 use egui_commonmark::CommonMarkViewer;
 
-use crate::app::{difficulty_color, AiMentorApp};
+use crate::app::AiMentorApp;
 use crate::models::DayStatus;
+use crate::ui::theme;
 
 pub fn show(app: &mut AiMentorApp, ui: &mut egui::Ui) {
     let Some(day) = app.current_day().cloned() else {
@@ -14,56 +15,70 @@ pub fn show(app: &mut AiMentorApp, ui: &mut egui::Ui) {
     navigation(app, ui, day.day_number);
     ui.add_space(4.0);
 
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(format!(" difficulty {} ", day.difficulty))
-                .color(egui::Color32::WHITE)
-                .background_color(difficulty_color(day.difficulty)),
-        );
-        ui.heading(format!("Day {} — {}", day.day_number, day.title));
-    });
-    ui.label(
-        egui::RichText::new(format!("Subskill: {} · {} min", day.subskill, day.est_minutes))
-            .weak(),
-    );
-
-    if !day.builds_on.is_empty() {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Builds on:").small().strong());
-            for chip in &day.builds_on {
-                ui.label(
-                    egui::RichText::new(format!(" {chip} "))
-                        .small()
-                        .background_color(ui.visuals().faint_bg_color),
-                );
-            }
+    let t = theme::current(ui);
+    theme::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            theme::pill(
+                ui,
+                format!("difficulty {}/5", day.difficulty),
+                theme::difficulty_color(day.difficulty, t.dark),
+            );
+            ui.label(
+                egui::RichText::new(format!("Day {} \u{2014} {}", day.day_number, day.title))
+                    .size(18.0)
+                    .strong(),
+            );
         });
-    }
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(format!(
+                "{} \u{00b7} {} min",
+                day.subskill, day.est_minutes
+            ))
+            .color(t.text_weak)
+            .size(12.5),
+        );
 
-    ui.separator();
+        if !day.builds_on.is_empty() {
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("BUILDS ON")
+                        .size(10.0)
+                        .color(t.text_muted)
+                        .strong(),
+                );
+                for chip in &day.builds_on {
+                    theme::chip(ui, chip);
+                }
+            });
+        }
+    });
+    ui.add_space(8.0);
 
     egui::ScrollArea::vertical()
         .id_salt("day_scroll")
         .show(ui, |ui| {
             if !day.objectives.is_empty() {
-                egui::CollapsingHeader::new("Objectives")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        for objective in &day.objectives {
-                            ui.label(format!("☐ {objective}"));
-                        }
-                    });
+                theme::titled_card(ui, "Objectives", |ui| {
+                    for objective in &day.objectives {
+                        ui.label(format!("\u{2610}  {objective}"));
+                    }
+                });
+                ui.add_space(8.0);
             }
 
-            content_section(app, ui, &day);
+            theme::card(ui, |ui| content_section(app, ui, &day));
             ui.add_space(8.0);
             hands_on_section(app, ui, &day);
             ui.add_space(8.0);
-            interview_section(app, ui, &day);
+            theme::card(ui, |ui| interview_section(app, ui, &day));
             ui.add_space(8.0);
-            practice_log(app, ui, &day);
-            ui.add_space(8.0);
-            notes(app, ui, &day);
+            theme::card(ui, |ui| {
+                practice_log(app, ui, &day);
+                ui.add_space(6.0);
+                notes(app, ui, &day);
+            });
         });
 }
 
@@ -119,7 +134,7 @@ fn navigation(app: &mut AiMentorApp, ui: &mut egui::Ui, day_number: i64) {
 
 fn content_section(app: &mut AiMentorApp, ui: &mut egui::Ui, day: &crate::models::Day) {
     ui.horizontal(|ui| {
-        ui.strong("Lesson");
+        theme::section_label(ui, "Lesson");
         if day.content_md.trim().is_empty() {
             if ui.button("Fetch content").clicked() {
                 app.fetch_day_content(day.id);
@@ -180,13 +195,31 @@ fn content_section(app: &mut AiMentorApp, ui: &mut egui::Ui, day: &crate::models
 }
 
 fn hands_on_section(app: &mut AiMentorApp, ui: &mut egui::Ui, day: &crate::models::Day) {
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.strong("Hands-on task");
+    let t = theme::current(ui);
+    egui::Frame::new()
+        .fill(t.surface)
+        .stroke(egui::Stroke::new(
+            1.0,
+            if day.hands_on_done { t.good } else { t.border },
+        ))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+        ui.horizontal(|ui| {
+            theme::section_label(ui, "Hands-on task");
+            if day.hands_on_done {
+                theme::pill(ui, "done", t.good);
+            } else {
+                theme::pill(ui, "required to finish the day", t.warning);
+            }
+        });
+        ui.add_space(6.0);
         ui.label(if day.practice_task.trim().is_empty() {
             "(no task recorded for this day)".to_string()
         } else {
             day.practice_task.clone()
         });
+        ui.add_space(6.0);
         let mut done = day.hands_on_done;
         if ui.checkbox(&mut done, "Task completed").changed() {
             if let Err(e) = app.db.set_day_hands_on(day.id, done) {
@@ -250,7 +283,7 @@ fn interview_section(app: &mut AiMentorApp, ui: &mut egui::Ui, day: &crate::mode
 
 fn practice_log(app: &mut AiMentorApp, ui: &mut egui::Ui, day: &crate::models::Day) {
     ui.horizontal(|ui| {
-        ui.strong("Log practice");
+        theme::section_label(ui, "Log practice");
         ui.add(
             egui::DragValue::new(&mut app.minutes_input)
                 .range(1..=600)

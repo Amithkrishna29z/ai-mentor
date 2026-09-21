@@ -48,7 +48,7 @@ jobs:
         run: |
           mkdir -p staging dist
           cp target/release/ai-mentor README.md staging/
-          tar -czf "dist/ai-mentor-${{ github.ref_name }}-${{ matrix.label }}.tar.gz" -C staging .
+          tar -czf "dist/ai-mentor-${{ github.ref_name }}-${{ matrix.label }}.tar.gz" -C staging ai-mentor README.md
 
       - name: Package (Windows)
         if: runner.os == 'Windows'

@@ -48,7 +48,9 @@ pub fn clone_repo(git_path: &str, url: &str) -> Result<(TempDir, String)> {
     let tmp = TempDir::new()?;
     let dest = tmp.path().join("repo");
 
-    let output = Command::new(git_path)
+    let mut clone = Command::new(git_path);
+    crate::mentor::hide_console(&mut clone);
+    let output = clone
         .arg("clone")
         .arg("--depth")
         .arg("1")
@@ -66,7 +68,9 @@ pub fn clone_repo(git_path: &str, url: &str) -> Result<(TempDir, String)> {
         );
     }
 
-    let sha = Command::new(git_path)
+    let mut rev_parse = Command::new(git_path);
+    crate::mentor::hide_console(&mut rev_parse);
+    let sha = rev_parse
         .arg("rev-parse")
         .arg("HEAD")
         .current_dir(&dest)
