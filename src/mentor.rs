@@ -1,0 +1,406 @@
+//! Claude CLI integration: prompt builders, process invocation on a background
+//! thread, JSON extraction/repair, and the 20-hour-rule complexity ramp.
+
+use anyhow::{anyhow, bail, Result};
+use std::path::Path;
+use std::process::Command;
+use std::sync::mpsc::Sender;
+
+use crate::models::*;
+
+/// How the `claude` binary is invoked. Every part is editable in Settings so a
+/// differently named or wrapped binary still works.
+#[derive(Debug, Clone)]
+pub struct CliConfig {
+    pub claude_path: String,
+    pub prompt_flag: String,
+    pub extra_args: String,
+    pub git_path: String,
+}
+
+impl Default for CliConfig {
+    fn default() -> Self {
+        Self {
+            claude_path: "claude".to_string(),
+            prompt_flag: "-p".to_string(),
+            extra_args: "--output-format text".to_string(),
+            git_path: "git".to_string(),
+        }
+    }
+}
+
+/// Results handed back to the UI thread from background jobs.
+pub enum JobResult {
+    Plan {
+        stack_id: i64,
+        tech: String,
+        outcome: Result<PlanJson, String>,
+        raw: String,
+    },
+    DayContent {
+        day_id: i64,
+        outcome: Result<String, String>,
+    },
+    Quiz {
+        plan_id: i64,
+        scope: String,
+        day_id: Option<i64>,
+        week_number: Option<i64>,
+        outcome: Result<QuizJson, String>,
+    },
+    Verify {
+        weekly_project_id: i64,
+        github_url: String,
+        commit_sha: String,
+        report_md: String,
+        outcome: Result<VerificationJson, String>,
+    },
+}
+
+/// Run the CLI once and return stdout. `cwd` sets the working directory so
+/// Claude Code can read a cloned repository's files.
+pub fn run_cli(cfg: &CliConfig, prompt: &str, cwd: Option<&Path>) -> Result<String> {
+    let mut cmd = Command::new(&cfg.claude_path);
+    cmd.arg(&cfg.prompt_flag).arg(prompt);
+    for arg in cfg.extra_args.split_whitespace() {
+        cmd.arg(arg);
+    }
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+
+    let output = cmd.output().map_err(|e| {
+        anyhow!(
+            "could not run '{}': {e}. Install the Claude CLI or set its path in Settings.",
+            cfg.claude_path
+        )
+    })?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "{} exited with {}: {}",
+            cfg.claude_path,
+            output.status,
+            err.trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+// ---------------------------------------------------------------------------
+// JSON extraction and repair
+// ---------------------------------------------------------------------------
+
+/// Pull the first balanced JSON object out of a CLI response, tolerating
+/// ```json fences and surrounding prose.
+pub fn extract_json(raw: &str) -> Option<&str> {
+    let bytes = raw.as_bytes();
+    let start = raw.find('{')?;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for i in start..bytes.len() {
+        let c = bytes[i] as char;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&raw[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The *last* balanced JSON object in a response — the verification prompt asks
+/// for a trailing JSON block after the human-readable report.
+pub fn extract_last_json(raw: &str) -> Option<&str> {
+    let mut best: Option<&str> = None;
+    let mut search_from = 0usize;
+    while let Some(rel) = raw[search_from..].find('{') {
+        let abs = search_from + rel;
+        if let Some(found) = extract_json(&raw[abs..]) {
+            best = Some(found);
+            search_from = abs + found.len();
+        } else {
+            search_from = abs + 1;
+        }
+        if search_from >= raw.len() {
+            break;
+        }
+    }
+    best
+}
+
+fn parse_json<T: serde::de::DeserializeOwned>(raw: &str) -> Result<T> {
+    let slice = extract_json(raw).ok_or_else(|| anyhow!("no JSON object found in CLI output"))?;
+    Ok(serde_json::from_str(slice)?)
+}
+
+/// Run a prompt expecting JSON; on a parse failure, retry once with a reminder.
+fn cli_json<T: serde::de::DeserializeOwned>(
+    cfg: &CliConfig,
+    prompt: &str,
+) -> std::result::Result<(T, String), (String, String)> {
+    let raw = match run_cli(cfg, prompt, None) {
+        Ok(r) => r,
+        Err(e) => return Err((e.to_string(), String::new())),
+    };
+    match parse_json::<T>(&raw) {
+        Ok(v) => Ok((v, raw)),
+        Err(first_err) => {
+            let retry_prompt = format!(
+                "{prompt}\n\nIMPORTANT: your previous answer could not be parsed ({first_err}). \
+                 Return valid JSON only - no prose, no markdown fences."
+            );
+            let raw2 = match run_cli(cfg, &retry_prompt, None) {
+                Ok(r) => r,
+                Err(e) => return Err((e.to_string(), raw)),
+            };
+            match parse_json::<T>(&raw2) {
+                Ok(v) => Ok((v, raw2)),
+                Err(e) => Err((format!("could not parse CLI JSON: {e}"), raw2)),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prompts
+// ---------------------------------------------------------------------------
+
+const PLAN_PROMPT: &str = r#"You are a technical mentor applying Josh Kaufman's "The First 20 Hours" method, training the learner to be hands-on and interview-ready in {TECH}. Deconstruct {TECH} into the highest-leverage subskills (the 20% that delivers 80% of real-world capability), then sequence them into a day-by-day plan of {MINUTES_PER_DAY}-minute sessions totaling {TARGET_HOURS} hours ({DAY_COUNT} days), grouped into 7-day weeks, each week ending in an applied project.
+
+Hard requirements: (1) "difficulty" (1-5) must be non-decreasing day over day - start foundational, end at interview/systems level. Week 1 = foundation (1-2), week 2 = applied/integration (2-3), week 3 = advanced/edge-cases (4), final days = interview-grade/systems (5). (2) From Week 2 onward each day must reuse earlier subskills - list them in "builds_on" - so complexity compounds instead of resetting. (3) Every day's "practice_task" is a concrete coding/build task, never "read about X". (4) Every day includes 2-4 realistic "interview_questions" with the key points of a strong answer. (5) Weekly projects grow in scope week over week.
+
+Output ONLY valid JSON matching this schema, nothing else:
+{
+  "tech": string,
+  "target_hours": number,
+  "minutes_per_day": number,
+  "subskills": [{ "name": string, "why": string, "priority": number }],
+  "days": [{ "day": number, "week": number, "title": string, "subskill": string,
+            "difficulty": number, "builds_on": [string],
+            "objectives": [string], "practice_task": string, "est_minutes": number,
+            "interview_questions": [{ "q": string, "key_points": [string] }] }],
+  "weekly_projects": [{ "week": number, "title": string, "description": string,
+                        "acceptance_criteria": [string] }]
+}"#;
+
+pub fn prompt_plan(tech: &str, target_hours: i64, minutes_per_day: i64) -> String {
+    let day_count = day_count(target_hours, minutes_per_day);
+    PLAN_PROMPT
+        .replace("{TECH}", tech)
+        .replace("{MINUTES_PER_DAY}", &minutes_per_day.to_string())
+        .replace("{TARGET_HOURS}", &target_hours.to_string())
+        .replace("{DAY_COUNT}", &day_count.to_string())
+}
+
+/// Days in a plan: ceil(target_hours * 60 / minutes_per_day).
+pub fn day_count(target_hours: i64, minutes_per_day: i64) -> i64 {
+    let per_day = minutes_per_day.max(1);
+    (target_hours * 60 + per_day - 1) / per_day
+}
+
+const DAY_PROMPT: &str = r#"You are a technical mentor training a hands-on, interview-ready engineer. Write a focused {EST_MINUTES}-minute code-first lesson in Markdown for Day {DAY} of learning {TECH} at difficulty {DIFFICULTY}/5. Subskill: "{SUBSKILL}". This day builds on: {BUILDS_ON} - assume the learner already knows those and go deeper; do not re-teach basics already covered. Objectives: {OBJECTIVES}.
+
+Structure: (1) concept in brief, (2) a substantial worked example with real code at this difficulty, (3) common pitfalls and edge cases, (4) the hands-on task to complete: "{PRACTICE_TASK}", (5) an "Interview check" section with these questions and strong-answer key points: {INTERVIEW_QUESTIONS}.
+
+Match the depth to difficulty {DIFFICULTY} - higher means more edge cases, performance, trade-offs, and system-level reasoning. Return Markdown only."#;
+
+pub fn prompt_day(tech: &str, day: &Day) -> String {
+    let builds_on = if day.builds_on.is_empty() {
+        "(nothing yet - this is a foundation day)".to_string()
+    } else {
+        day.builds_on.join(", ")
+    };
+    let objectives = if day.objectives.is_empty() {
+        "(none supplied)".to_string()
+    } else {
+        day.objectives.join("; ")
+    };
+    let questions = if day.interview_questions.is_empty() {
+        "(generate 2-3 suitable ones)".to_string()
+    } else {
+        day.interview_questions
+            .iter()
+            .map(|q| q.q.clone())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    DAY_PROMPT
+        .replace("{EST_MINUTES}", &day.est_minutes.to_string())
+        .replace("{DAY}", &day.day_number.to_string())
+        .replace("{TECH}", tech)
+        .replace("{DIFFICULTY}", &day.difficulty.to_string())
+        .replace("{SUBSKILL}", &day.subskill)
+        .replace("{BUILDS_ON}", &builds_on)
+        .replace("{OBJECTIVES}", &objectives)
+        .replace("{PRACTICE_TASK}", &day.practice_task)
+        .replace("{INTERVIEW_QUESTIONS}", &questions)
+}
+
+const QUIZ_PROMPT: &str = r#"Generate a {N}-question multiple-choice recall quiz on {SCOPE_CONTENT} for {TECH}. Each question has 4 options, one correct, and a one-line explanation. Bias toward concepts a learner forgets and interviewers probe. Output ONLY JSON:
+{ "questions": [ { "question": string, "options": [string,string,string,string], "correct_index": number, "explanation": string } ] }"#;
+
+pub fn prompt_quiz(tech: &str, scope_content: &str, n: i64) -> String {
+    QUIZ_PROMPT
+        .replace("{N}", &n.to_string())
+        .replace("{SCOPE_CONTENT}", scope_content)
+        .replace("{TECH}", tech)
+}
+
+const VERIFY_PROMPT: &str = r#"You are a senior code reviewer. Review this repository against what the learner just studied this week: {WEEK_SUBSKILLS} and the project requirements: {PROJECT_DESCRIPTION} / acceptance criteria: {ACCEPTANCE}.
+
+Find real bugs, security issues, bad practices, and gaps vs. the acceptance criteria. Give concrete, actionable suggested changes referencing files/lines where possible. Write the review as Markdown.
+
+End your answer with a single JSON block and nothing after it:
+{"verdict":"pass|needs_work|fail","score":0-100,"issues":[{"severity":"high|med|low","file":string,"line":number,"issue":string,"suggestion":string}]}"#;
+
+pub fn prompt_verify(week_subskills: &str, description: &str, acceptance: &str) -> String {
+    VERIFY_PROMPT
+        .replace("{WEEK_SUBSKILLS}", week_subskills)
+        .replace("{PROJECT_DESCRIPTION}", description)
+        .replace("{ACCEPTANCE}", acceptance)
+}
+
+// ---------------------------------------------------------------------------
+// Complexity ramp enforcement
+// ---------------------------------------------------------------------------
+
+/// Guarantee the 20-hour-rule ramp in code, whatever the model returned:
+/// clamp difficulty to 1..=5, stable-sort days by difficulty, then renumber
+/// days and weeks sequentially. Weekly projects are deduped and re-keyed so the
+/// week numbers line up with the renumbered days.
+pub fn enforce_ramp(plan: &mut PlanJson) {
+    for day in &mut plan.days {
+        day.difficulty = day.difficulty.clamp(1, 5);
+        if day.est_minutes <= 0 {
+            day.est_minutes = 60;
+        }
+    }
+    plan.days.sort_by_key(|d| d.difficulty); // stable: ties keep CLI order
+    for (idx, day) in plan.days.iter_mut().enumerate() {
+        day.day = idx as i64 + 1;
+        day.week = (idx as i64 / 7) + 1;
+    }
+
+    let weeks = plan.days.last().map(|d| d.week).unwrap_or(0);
+    plan.weekly_projects.sort_by_key(|w| w.week);
+    plan.weekly_projects.dedup_by_key(|w| w.week);
+    plan.weekly_projects.retain(|w| w.week >= 1 && w.week <= weeks);
+    // Fill any week the model skipped so every week has a project row.
+    for week in 1..=weeks {
+        if !plan.weekly_projects.iter().any(|w| w.week == week) {
+            plan.weekly_projects.push(WeeklyProjectJson {
+                week,
+                title: format!("Week {week} project"),
+                description:
+                    "Apply this week's subskills in a single working build of your own design."
+                        .to_string(),
+                acceptance_criteria: vec![
+                    "Runs end to end".to_string(),
+                    "Uses every subskill studied this week".to_string(),
+                ],
+            });
+        }
+    }
+    plan.weekly_projects.sort_by_key(|w| w.week);
+}
+
+/// Subskills studied in a given week, for the verification prompt.
+pub fn week_subskills(days: &[Day], week: i64) -> String {
+    let names: Vec<String> = days
+        .iter()
+        .filter(|d| d.week_number == week)
+        .map(|d| format!("{} ({})", d.subskill, d.title))
+        .collect();
+    if names.is_empty() {
+        "(no days recorded for this week)".to_string()
+    } else {
+        names.join("; ")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background jobs
+// ---------------------------------------------------------------------------
+
+pub fn spawn_plan(
+    tx: Sender<JobResult>,
+    cfg: CliConfig,
+    stack_id: i64,
+    tech: String,
+    target_hours: i64,
+    minutes_per_day: i64,
+) {
+    std::thread::spawn(move || {
+        let prompt = prompt_plan(&tech, target_hours, minutes_per_day);
+        let result = match cli_json::<PlanJson>(&cfg, &prompt) {
+            Ok((mut plan, raw)) => {
+                enforce_ramp(&mut plan);
+                JobResult::Plan {
+                    stack_id,
+                    tech,
+                    outcome: Ok(plan),
+                    raw,
+                }
+            }
+            Err((err, raw)) => JobResult::Plan {
+                stack_id,
+                tech,
+                outcome: Err(err),
+                raw,
+            },
+        };
+        let _ = tx.send(result);
+    });
+}
+
+pub fn spawn_day_content(tx: Sender<JobResult>, cfg: CliConfig, day_id: i64, prompt: String) {
+    std::thread::spawn(move || {
+        let outcome = run_cli(&cfg, &prompt, None)
+            .map(|md| md.trim().to_string())
+            .map_err(|e| e.to_string());
+        let _ = tx.send(JobResult::DayContent { day_id, outcome });
+    });
+}
+
+pub fn spawn_quiz(
+    tx: Sender<JobResult>,
+    cfg: CliConfig,
+    plan_id: i64,
+    scope: String,
+    day_id: Option<i64>,
+    week_number: Option<i64>,
+    prompt: String,
+) {
+    std::thread::spawn(move || {
+        let outcome = cli_json::<QuizJson>(&cfg, &prompt)
+            .map(|(q, _)| q)
+            .map_err(|(e, _)| e);
+        let _ = tx.send(JobResult::Quiz {
+            plan_id,
+            scope,
+            day_id,
+            week_number,
+            outcome,
+        });
+    });
+}
