@@ -404,3 +404,116 @@ pub fn spawn_quiz(
         });
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn day(day: i64, difficulty: i64) -> DayJson {
+        DayJson {
+            day,
+            week: 1,
+            title: format!("Day {day}"),
+            difficulty,
+            est_minutes: 60,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ramp_is_monotonic_after_enforcement() {
+        let mut plan = PlanJson {
+            days: vec![day(1, 4), day(2, 1), day(3, 9), day(4, 2), day(5, 0)],
+            ..Default::default()
+        };
+        enforce_ramp(&mut plan);
+
+        let difficulties: Vec<i64> = plan.days.iter().map(|d| d.difficulty).collect();
+        assert_eq!(difficulties, vec![1, 1, 2, 4, 5], "out-of-range values clamp to 1..=5");
+        assert!(difficulties.windows(2).all(|w| w[0] <= w[1]));
+
+        let numbers: Vec<i64> = plan.days.iter().map(|d| d.day).collect();
+        assert_eq!(numbers, vec![1, 2, 3, 4, 5], "days are renumbered sequentially");
+    }
+
+    #[test]
+    fn weeks_are_seven_days_and_every_week_gets_a_project() {
+        let mut plan = PlanJson {
+            days: (1..=20).map(|i| day(i, 1 + i / 7)).collect(),
+            ..Default::default()
+        };
+        enforce_ramp(&mut plan);
+
+        assert_eq!(plan.days[0].week, 1);
+        assert_eq!(plan.days[6].week, 1);
+        assert_eq!(plan.days[7].week, 2);
+        assert_eq!(plan.days[19].week, 3);
+        let weeks: Vec<i64> = plan.weekly_projects.iter().map(|w| w.week).collect();
+        assert_eq!(weeks, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn json_survives_fences_and_surrounding_prose() {
+        let raw = "Sure! Here is the plan:\n```json\n{\"tech\":\"Java\",\"days\":[]}\n```\nHope that helps.";
+        let slice = extract_json(raw).expect("object found");
+        let parsed: PlanJson = serde_json::from_str(slice).expect("parses");
+        assert_eq!(parsed.tech, "Java");
+    }
+
+    #[test]
+    fn verdict_block_is_taken_from_the_end_of_a_review() {
+        let raw = r#"# Review
+The `{}` placeholder in Foo.java is wrong.
+{"verdict":"needs_work","score":62,"issues":[{"severity":"high","file":"A.java","line":12,"issue":"NPE","suggestion":"guard"}]}"#;
+        let slice = extract_last_json(raw).expect("trailing object");
+        let parsed: VerificationJson = serde_json::from_str(slice).expect("parses");
+        assert_eq!(parsed.verdict, "needs_work");
+        assert_eq!(parsed.score, 62);
+        assert_eq!(parsed.issues.len(), 1);
+    }
+
+    #[test]
+    fn day_count_rounds_up() {
+        assert_eq!(day_count(20, 60), 20);
+        assert_eq!(day_count(20, 90), 14);
+        assert_eq!(day_count(20, 45), 27);
+    }
+}
+
+/// Exercises the real `claude` binary end to end: prompt -> CLI -> JSON ->
+/// ramp enforcement. Ignored by default so the suite stays offline; run with
+/// `cargo test -- --ignored --nocapture`.
+#[cfg(test)]
+mod cli_integration {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn plan_prompt_round_trips_through_the_real_cli() {
+        let cfg = CliConfig::default();
+        let prompt = prompt_plan("Redis", 4, 60);
+        let raw = run_cli(&cfg, &prompt, None).expect("claude CLI ran");
+        let slice = extract_json(&raw).expect("a JSON object in the reply");
+        let mut plan: PlanJson = serde_json::from_str(slice).expect("parses as a plan");
+
+        assert!(!plan.days.is_empty(), "the plan has days");
+        assert!(!plan.subskills.is_empty(), "the plan has subskills");
+        enforce_ramp(&mut plan);
+
+        let difficulties: Vec<i64> = plan.days.iter().map(|d| d.difficulty).collect();
+        assert!(
+            difficulties.windows(2).all(|w| w[0] <= w[1]),
+            "difficulty never decreases: {difficulties:?}"
+        );
+        assert!(
+            plan.days.iter().all(|d| !d.practice_task.trim().is_empty()),
+            "every day has a hands-on task"
+        );
+        println!(
+            "{} days, difficulties {:?}, {} weekly projects",
+            plan.days.len(),
+            difficulties,
+            plan.weekly_projects.len()
+        );
+    }
+}
