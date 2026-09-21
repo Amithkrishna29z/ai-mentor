@@ -80,7 +80,25 @@ CLI output, and the day-count formula.
 ### CI
 
 `.github/workflows/build.yml` runs a matrix over `ubuntu-latest` and `windows-latest`: release
-build, tests, and both binaries uploaded as artifacts.
+build, tests, and both binaries uploaded as artifacts. It fires on pushes to `main`, on pull
+requests, and on demand.
+
+### Releases (CD)
+
+`.github/workflows/release.yml` builds and tests on both platforms, then packages each one —
+binary plus this README — into `ai-mentor-<tag>-linux-x86_64.tar.gz` and
+`ai-mentor-<tag>-windows-x86_64.zip`, and attaches both to a GitHub release with generated notes.
+
+Cut a release by pushing a version tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Running the workflow manually (**Actions → release → Run workflow**) builds and uploads the same
+archives as run artifacts but publishes nothing — the publish job is gated on a `v*` tag, so it is
+safe as a dry run.
 
 ---
 
