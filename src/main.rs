@@ -32,6 +32,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([width.max(800.0), height.max(560.0)])
             .with_min_inner_size([900.0, 560.0])
+            // A size saved on a bigger screen must not open off-display here.
+            .with_clamp_size_to_monitor_size(true)
             .with_title("AI Mentor"),
         ..Default::default()
     };

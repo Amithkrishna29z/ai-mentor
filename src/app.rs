@@ -836,6 +836,11 @@ impl AiMentorApp {
             return;
         }
         self.last_size_save = now;
+        // A maximized window's size is not a size to reopen at: restoring it
+        // un-maximized would hang off the edge of the screen.
+        if ctx.input(|i| i.viewport().maximized) == Some(true) {
+            return;
+        }
         if let Some(rect) = ctx.input(|i| i.viewport().inner_rect) {
             let _ = self
                 .db
