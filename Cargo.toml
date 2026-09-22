@@ -1,6 +1,6 @@
 [package]
 name = "ai-mentor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Mentors you through advanced tech topics using Josh Kaufman's 20-hour rule, powered by the Claude CLI."
 license = "MIT"
