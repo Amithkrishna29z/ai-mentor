@@ -1,5 +1,6 @@
 //! Application state, background-job plumbing and the eframe update loop.
 
+use std::collections::VecDeque;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use egui_commonmark::CommonMarkCache;
@@ -44,6 +45,32 @@ pub enum StudyView {
     Weekly,
 }
 
+/// A CLI job waiting its turn. Everything that shells out to the Claude CLI
+/// goes through the queue, so a 20-day course fetches steadily instead of
+/// launching twenty processes at once.
+pub enum QueuedJob {
+    Plan {
+        stack_id: i64,
+        tech: String,
+        target_hours: i64,
+        minutes_per_day: i64,
+    },
+    DayContent {
+        day_id: i64,
+        prompt: String,
+    },
+    Quiz {
+        plan_id: i64,
+        scope: String,
+        day_id: Option<i64>,
+        week_number: Option<i64>,
+        prompt: String,
+    },
+    Verify {
+        request: verify::VerifyRequest,
+    },
+}
+
 /// An in-progress quiz attempt.
 pub struct QuizState {
     pub quiz_id: i64,
@@ -74,6 +101,11 @@ pub struct AiMentorApp {
     pub tx: Sender<JobResult>,
     pub rx: Receiver<JobResult>,
     pub jobs_in_flight: usize,
+    /// Pending CLI work and how much of it is running right now.
+    pub queue: VecDeque<QueuedJob>,
+    pub cli_active: usize,
+    pub max_concurrent: usize,
+    pub auto_fetch_lessons: bool,
     pub status: String,
     pub error: Option<String>,
 
@@ -144,6 +176,8 @@ impl AiMentorApp {
         };
         let tab = Tab::parse(&db.setting_or("active_tab", "study"));
         let dark_mode = db.setting_or("dark_mode", "1") == "1";
+        let max_concurrent = db.setting_i64("max_concurrent_cli", 1).clamp(1, 4) as usize;
+        let auto_fetch_lessons = db.setting_or("auto_fetch_lessons", "1") == "1";
         let last_subject = db.get_setting("last_subject").and_then(|s| s.parse().ok());
         let stacks = db.all_stacks().unwrap_or_default();
 
@@ -153,6 +187,10 @@ impl AiMentorApp {
             tx,
             rx,
             jobs_in_flight: 0,
+            queue: VecDeque::new(),
+            cli_active: 0,
+            max_concurrent,
+            auto_fetch_lessons,
             status: "Ready".to_string(),
             error: None,
             stacks,
@@ -289,6 +327,91 @@ impl AiMentorApp {
             .unwrap_or(0)
     }
 
+    // -- the CLI job queue -------------------------------------------------
+
+    pub fn enqueue(&mut self, job: QueuedJob) {
+        self.queue.push_back(job);
+        self.pump_queue();
+    }
+
+    /// Start queued jobs until the concurrency cap is reached.
+    pub fn pump_queue(&mut self) {
+        while self.cli_active < self.max_concurrent {
+            let Some(job) = self.queue.pop_front() else {
+                return;
+            };
+            match job {
+                QueuedJob::Plan {
+                    stack_id,
+                    tech,
+                    target_hours,
+                    minutes_per_day,
+                } => mentor::spawn_plan(
+                    self.tx.clone(),
+                    self.cfg.clone(),
+                    stack_id,
+                    tech,
+                    target_hours,
+                    minutes_per_day,
+                ),
+                QueuedJob::DayContent { day_id, prompt } => {
+                    mentor::spawn_day_content(self.tx.clone(), self.cfg.clone(), day_id, prompt)
+                }
+                QueuedJob::Quiz {
+                    plan_id,
+                    scope,
+                    day_id,
+                    week_number,
+                    prompt,
+                } => mentor::spawn_quiz(
+                    self.tx.clone(),
+                    self.cfg.clone(),
+                    plan_id,
+                    scope,
+                    day_id,
+                    week_number,
+                    prompt,
+                ),
+                QueuedJob::Verify { request } => {
+                    verify::spawn_verify(self.tx.clone(), self.cfg.clone(), request)
+                }
+            }
+            self.cli_active += 1;
+            self.jobs_in_flight += 1;
+        }
+    }
+
+    /// Drop everything still waiting. A job already running finishes.
+    pub fn clear_queue(&mut self) {
+        let dropped = self.queue.len();
+        self.queue.clear();
+        self.status = format!("Stopped: {dropped} queued job(s) dropped.");
+    }
+
+    /// Queue a lesson fetch for every day of a plan that has no content yet.
+    fn enqueue_lessons_for_plan(&mut self, plan_id: i64, tech: &str) {
+        let Ok(days) = self.db.days_for_plan(plan_id) else {
+            return;
+        };
+        let mut queued = 0;
+        for day in days {
+            // Never clobber a lesson the learner has edited or already has.
+            if day.content_edited || !day.content_md.trim().is_empty() {
+                continue;
+            }
+            let prompt = mentor::prompt_day(tech, &day);
+            self.queue.push_back(QueuedJob::DayContent {
+                day_id: day.id,
+                prompt,
+            });
+            queued += 1;
+        }
+        if queued > 0 {
+            self.status = format!("{tech}: fetching {queued} lessons with the Claude CLI…");
+            self.pump_queue();
+        }
+    }
+
     // -- background jobs ---------------------------------------------------
 
     pub fn generate_plans_for_selected(&mut self) {
@@ -311,35 +434,31 @@ impl AiMentorApp {
             if matches!(self.db.plan_for_stack(id), Ok(Some(_))) {
                 continue; // keep existing plans; use Regenerate to replace one
             }
-            mentor::spawn_plan(
-                self.tx.clone(),
-                self.cfg.clone(),
-                id,
-                name,
+            self.queue.push_back(QueuedJob::Plan {
+                stack_id: id,
+                tech: name,
                 target_hours,
                 minutes_per_day,
-            );
-            self.jobs_in_flight += 1;
+            });
             launched += 1;
         }
+        self.pump_queue();
         self.status = if launched == 0 {
             "Every selected subject already has a plan.".to_string()
         } else {
-            format!("Generating {launched} plan(s) with the Claude CLI…")
+            format!("Generating {launched} course(s) with the Claude CLI…")
         };
     }
 
     pub fn regenerate_plan(&mut self, stack_id: i64, tech: String) {
-        mentor::spawn_plan(
-            self.tx.clone(),
-            self.cfg.clone(),
+        let job = QueuedJob::Plan {
             stack_id,
-            tech.clone(),
-            self.settings_form.target_hours,
-            self.settings_form.minutes_per_day,
-        );
-        self.jobs_in_flight += 1;
-        self.status = format!("Regenerating the {tech} plan…");
+            tech: tech.clone(),
+            target_hours: self.settings_form.target_hours,
+            minutes_per_day: self.settings_form.minutes_per_day,
+        };
+        self.enqueue(job);
+        self.status = format!("Generating the {tech} course…");
     }
 
     pub fn fetch_day_content(&mut self, day_id: i64) {
@@ -348,9 +467,8 @@ impl AiMentorApp {
         };
         let tech = self.active_stack_name();
         let prompt = mentor::prompt_day(&tech, &day);
-        mentor::spawn_day_content(self.tx.clone(), self.cfg.clone(), day_id, prompt);
-        self.jobs_in_flight += 1;
-        self.status = format!("Fetching Day {} content…", day.day_number);
+        self.enqueue(QueuedJob::DayContent { day_id, prompt });
+        self.status = format!("Fetching the Day {} lesson…", day.day_number);
     }
 
     pub fn start_quiz(&mut self, scope: &str, day_id: Option<i64>, week: Option<i64>) {
@@ -382,16 +500,13 @@ impl AiMentorApp {
             _ => return,
         };
         let prompt = mentor::prompt_quiz(&tech, &scope_content, self.settings_form.quiz_length);
-        mentor::spawn_quiz(
-            self.tx.clone(),
-            self.cfg.clone(),
-            plan,
-            scope.to_string(),
+        self.enqueue(QueuedJob::Quiz {
+            plan_id: plan,
+            scope: scope.to_string(),
             day_id,
-            week,
+            week_number: week,
             prompt,
-        );
-        self.jobs_in_flight += 1;
+        });
         self.status = "Generating a recall quiz…".to_string();
     }
 
@@ -451,8 +566,7 @@ impl AiMentorApp {
             description: format!("{} - {}", project.title, project.description),
             acceptance: project.acceptance.join("; "),
         };
-        verify::spawn_verify(self.tx.clone(), self.cfg.clone(), req);
-        self.jobs_in_flight += 1;
+        self.enqueue(QueuedJob::Verify { request: req });
         self.status = "Cloning the repo and reviewing it with the Claude CLI…".to_string();
         self.reload_subject();
     }
@@ -505,8 +619,8 @@ impl AiMentorApp {
             .db
             .save_plan(stack_id, target_hours, minutes_per_day, plan, raw)
         {
-            Ok(_) => {
-                self.status = format!("Plan saved: {} days.", plan.days.len());
+            Ok(plan_id) => {
+                self.status = format!("Course saved: {} days.", plan.days.len());
                 if self.active_stack.is_none() {
                     self.active_stack = Some(stack_id);
                 }
@@ -515,6 +629,17 @@ impl AiMentorApp {
                     self.reload_subject();
                 }
                 self.reload_due_cards();
+                // Pull the actual study material so the course is readable in
+                // the app rather than a list of empty days.
+                if self.auto_fetch_lessons {
+                    let tech = self
+                        .stacks
+                        .iter()
+                        .find(|s| s.id == stack_id)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| plan.tech.clone());
+                    self.enqueue_lessons_for_plan(plan_id, &tech);
+                }
             }
             Err(e) => self.error = Some(format!("Could not save the plan: {e}")),
         }
@@ -523,8 +648,15 @@ impl AiMentorApp {
     // -- job results -------------------------------------------------------
 
     fn drain_jobs(&mut self) {
+        let mut finished_cli = 0usize;
         while let Ok(result) = self.rx.try_recv() {
             self.jobs_in_flight = self.jobs_in_flight.saturating_sub(1);
+            if !matches!(
+                result,
+                JobResult::UpdateCheck { .. } | JobResult::UpdateInstall { .. }
+            ) {
+                finished_cli += 1;
+            }
             match result {
                 JobResult::Plan {
                     stack_id,
@@ -547,7 +679,12 @@ impl AiMentorApp {
                         if let Err(e) = self.db.set_day_content(day_id, &md, false) {
                             self.error = Some(e.to_string());
                         } else {
-                            self.status = "Day content fetched.".to_string();
+                            let left = self.queue.len();
+                            self.status = if left > 0 {
+                                format!("Lesson ready · {left} still queued")
+                            } else {
+                                "Lesson ready.".to_string()
+                            };
                             self.reload_subject();
                         }
                     }
@@ -637,6 +774,12 @@ impl AiMentorApp {
                     }
                 },
             }
+        }
+
+        // Free the slots those jobs held and start whatever is next in line.
+        self.cli_active = self.cli_active.saturating_sub(finished_cli);
+        if finished_cli > 0 {
+            self.pump_queue();
         }
     }
 
@@ -872,11 +1015,16 @@ impl AiMentorApp {
         ui.horizontal(|ui| {
             if self.jobs_in_flight > 0 {
                 ui.spinner();
-                ui.label(
-                    egui::RichText::new(format!("{} running", self.jobs_in_flight))
-                        .color(t.accent)
-                        .size(12.0),
-                );
+                let queued = self.queue.len();
+                let label = if queued > 0 {
+                    format!("{} running · {queued} queued", self.jobs_in_flight)
+                } else {
+                    format!("{} running", self.jobs_in_flight)
+                };
+                ui.label(egui::RichText::new(label).color(t.accent).size(12.0));
+                if queued > 0 && ui.small_button("stop").clicked() {
+                    self.clear_queue();
+                }
                 ui.add_space(6.0);
             }
             ui.label(

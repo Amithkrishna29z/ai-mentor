@@ -33,12 +33,17 @@ fn to_json<T: serde::Serialize>(value: &T) -> String {
 impl Db {
     /// Open (creating if needed) the database in the OS data directory.
     pub fn open() -> Result<Self> {
-        let path = Self::db_path()?;
+        Self::open_at(&Self::db_path()?)
+    }
+
+    /// Open a database at an explicit path. Tests use this to work against a
+    /// temp file instead of the real one.
+    pub fn open_at(path: &std::path::Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating data dir {}", parent.display()))?;
         }
-        let conn = Connection::open(&path)
+        let conn = Connection::open(path)
             .with_context(|| format!("opening database {}", path.display()))?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let db = Self { conn };
@@ -979,3 +984,65 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT NOT NULL
 );
 "#;
+
+#[cfg(test)]
+mod course_pipeline {
+    use super::*;
+    use crate::mentor::{self, CliConfig};
+
+    /// The whole study-course path against the real Claude CLI: generate the
+    /// course, store it, fetch a day's lesson, and read it back the way the
+    /// Day view does. Ignored by default:
+    /// `cargo test -- --ignored --nocapture course_is_generated`.
+    #[test]
+    #[ignore]
+    fn course_is_generated_and_its_lesson_is_readable() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut db = Db::open_at(&tmp.path().join("test.db")).expect("db opens");
+
+        let stack_id = db
+            .stack_id_by_name("Redis")
+            .expect("query")
+            .expect("Redis is seeded");
+
+        // 1. The CLI builds the course.
+        let cfg = CliConfig::default();
+        let prompt = mentor::prompt_plan("Redis", 2, 60);
+        let raw = mentor::run_cli(&cfg, &prompt, None).expect("claude CLI ran");
+        let slice = mentor::extract_json(&raw).expect("JSON in the reply");
+        let mut plan: PlanJson = serde_json::from_str(slice).expect("plan parses");
+        mentor::enforce_ramp(&mut plan);
+        assert!(!plan.days.is_empty(), "the course has days");
+
+        // 2. It is stored as days the app can show.
+        let plan_id = db
+            .save_plan(stack_id, 2, 60, &plan, &raw)
+            .expect("plan saved");
+        let days = db.days_for_plan(plan_id).expect("days load");
+        assert_eq!(days.len(), plan.days.len());
+        assert!(
+            days.iter().all(|d| d.content_md.is_empty()),
+            "lessons start empty"
+        );
+
+        // 3. The lesson for day 1 is fetched by the CLI, exactly as the queue does.
+        let day = &days[0];
+        println!("fetching lesson for Day {}: {}", day.day_number, day.title);
+        let lesson_prompt = mentor::prompt_day("Redis", day);
+        let lesson = mentor::run_cli(&cfg, &lesson_prompt, None).expect("lesson fetched");
+        db.set_day_content(day.id, lesson.trim(), false)
+            .expect("lesson stored");
+
+        // 4. It reads back as study material the Day view can render.
+        let reloaded = db.days_for_plan(plan_id).expect("days reload");
+        let first = &reloaded[0];
+        println!("lesson is {} chars", first.content_md.len());
+        println!("--- first 400 chars ---\n{}", &first.content_md.chars().take(400).collect::<String>());
+        assert!(
+            first.content_md.len() > 500,
+            "the stored lesson has real content, got {} chars",
+            first.content_md.len()
+        );
+        assert!(!first.content_edited, "untouched lessons stay auto-refreshable");
+    }
+}

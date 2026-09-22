@@ -55,6 +55,41 @@ pub fn show(app: &mut AiMentorApp, ctx: &egui::Context) {
                         egui::DragValue::new(&mut app.settings_form.unlock_threshold).range(10..=100),
                     );
                     ui.end_row();
+
+                    ui.label("Concurrent CLI jobs");
+                    let mut concurrent = app.max_concurrent as i64;
+                    if ui
+                        .add(egui::DragValue::new(&mut concurrent).range(1..=4))
+                        .on_hover_text(
+                            "How many Claude CLI processes may run at once. \
+                             1 keeps the course fetching steadily in the background.",
+                        )
+                        .changed()
+                    {
+                        app.max_concurrent = concurrent.clamp(1, 4) as usize;
+                        let _ = app
+                            .db
+                            .set_setting("max_concurrent_cli", &app.max_concurrent.to_string());
+                        app.pump_queue();
+                    }
+                    ui.end_row();
+
+                    ui.label("Fetch lessons automatically");
+                    let mut auto = app.auto_fetch_lessons;
+                    if ui
+                        .checkbox(&mut auto, "")
+                        .on_hover_text(
+                            "After a course is generated, pull every day's lesson from the \
+                             Claude CLI so it is ready to read in the app.",
+                        )
+                        .changed()
+                    {
+                        app.auto_fetch_lessons = auto;
+                        let _ = app
+                            .db
+                            .set_setting("auto_fetch_lessons", if auto { "1" } else { "0" });
+                    }
+                    ui.end_row();
                 });
 
             ui.add_space(6.0);

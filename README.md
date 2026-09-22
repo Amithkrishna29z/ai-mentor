@@ -16,7 +16,9 @@ with a built-in **Full-Stack Java Spring Boot Developer** roadmap as the flagshi
 | Feature | Detail |
 | --- | --- |
 | **Subject selection** | 29 seeded stacks grouped by Backend / Database / Frontend / DevOps / Cloud / Foundations, plus custom subjects. Selection persists in SQLite. |
-| **20-hour plans** | Claude deconstructs the skill, ranks subskills by payoff, and sequences them into `ceil(target_hours × 60 / minutes_per_day)` daily sessions grouped into 7-day weeks. |
+| **20-hour courses** | Claude deconstructs the skill, ranks subskills by payoff, and sequences them into `ceil(target_hours × 60 / minutes_per_day)` daily sessions grouped into 7-day weeks. |
+| **Study material fetched for you** | Generating a course then pulls **every day's full lesson** from the Claude CLI in the background, so the course is readable in the app instead of a list of empty days. |
+| **One CLI job at a time** | Every Claude/git call goes through a queue (concurrency configurable, default 1), so a 20-day course fetches steadily rather than launching twenty processes at once. The status bar shows what is running and queued, with a **stop** control. |
 | **Complexity ramp** | Every day carries a difficulty of 1–5 that **never decreases**. The app enforces this in code after parsing — it clamps to 1–5, stable-sorts by difficulty, then renumbers days and weeks. Later days list the earlier subskills they reuse ("Builds on"). |
 | **Hands-on gate** | Every day has a concrete coding task. A day **cannot be marked `done`** until its "Task completed" checkbox is ticked; un-ticking it drops the day back to *in progress*. |
 | **Editable content** | Day lessons are Markdown, rendered with `egui_commonmark`. Toggle **Edit** for a raw editor. Once you edit a day it is flagged `content_edited` and only an explicit **Regenerate** replaces it. |
@@ -30,6 +32,25 @@ with a built-in **Full-Stack Java Spring Boot Developer** roadmap as the flagshi
 | **Theme** | A dark and a light theme built on a validated palette, switchable from the header; the choice persists. |
 
 ---
+
+## Generating a course
+
+1. Tick one or more subjects in the left panel and press **Generate plan for selected**
+   (or open a subject with no course and press the button in its empty state).
+2. The Claude CLI builds the course: the highest-leverage subskills, sequenced into days
+   with objectives, a hands-on task and interview questions, difficulty never decreasing.
+3. As soon as the course is stored, the app queues **a lesson fetch for every day** and
+   works through them one at a time. The status bar reads e.g. `1 running · 17 queued`,
+   and each lesson appears in the **Day** view as it lands.
+4. Nothing blocks: you can read Day 1 while Day 12 is still being written.
+
+Lessons are Markdown and fully editable. Once you edit one it is flagged and never
+auto-overwritten — only an explicit **Regenerate** replaces it. Turn the automatic fetch
+off (or raise the concurrency) under **Settings**; a day can always be fetched on demand
+with **Fetch content**.
+
+A 20-day course means 21 CLI calls (one for the plan, one per lesson) and takes a while —
+they run in the background, and **stop** in the status bar drops whatever is still queued.
 
 ## Updating
 
