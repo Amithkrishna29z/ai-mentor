@@ -154,7 +154,7 @@ fn day_grid(app: &mut AiMentorApp, ui: &mut egui::Ui) {
                         theme::difficulty_color(day.difficulty, t.dark),
                     )
                     .on_hover_text(format!("difficulty {}/5", day.difficulty));
-                    ui.colored_label(status_color(day.status, &t), "\u{25cf}")
+                    ui.colored_label(status_color(day.status, &t), "\u{23fa}")
                         .on_hover_text(day.status.label());
                     ui.label(
                         egui::RichText::new(format!("Day {}", day.day_number))
@@ -170,7 +170,12 @@ fn day_grid(app: &mut AiMentorApp, ui: &mut egui::Ui) {
                                 .color(t.text_muted),
                         );
                         if day.hands_on_done {
-                            ui.label(egui::RichText::new("\u{2714}").size(11.0).color(t.good))
+                            ui.label(
+                                egui::RichText::new("\u{2714}")
+                                    .size(11.0)
+                                    .monospace()
+                                    .color(t.good),
+                            )
                                 .on_hover_text("hands-on task done");
                         }
                     });

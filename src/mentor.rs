@@ -61,6 +61,9 @@ pub enum JobResult {
     UpdateInstall {
         outcome: std::result::Result<String, String>,
     },
+    CliTest {
+        outcome: std::result::Result<String, String>,
+    },
 }
 
 /// Spawn child processes without a console window.
@@ -209,6 +212,8 @@ fn cli_json<T: serde::de::DeserializeOwned>(
 
 const PLAN_PROMPT: &str = r#"You are a technical mentor applying Josh Kaufman's "The First 20 Hours" method, training the learner to be hands-on and interview-ready in {TECH}. Deconstruct {TECH} into the highest-leverage subskills (the 20% that delivers 80% of real-world capability), then sequence them into a day-by-day plan of {MINUTES_PER_DAY}-minute sessions totaling {TARGET_HOURS} hours ({DAY_COUNT} days), grouped into 7-day weeks, each week ending in an applied project.
 
+{PRIOR_SUBJECTS}
+
 Hard requirements: (1) "difficulty" (1-5) must be non-decreasing day over day - start foundational, end at interview/systems level. Week 1 = foundation (1-2), week 2 = applied/integration (2-3), week 3 = advanced/edge-cases (4), final days = interview-grade/systems (5). (2) From Week 2 onward each day must reuse earlier subskills - list them in "builds_on" - so complexity compounds instead of resetting. (3) Every day's "practice_task" is a concrete coding/build task, never "read about X". (4) Every day includes 2-4 realistic "interview_questions" with the key points of a strong answer. (5) Weekly projects grow in scope week over week.
 
 Output ONLY valid JSON matching this schema, nothing else:
@@ -225,13 +230,35 @@ Output ONLY valid JSON matching this schema, nothing else:
                         "acceptance_criteria": [string] }]
 }"#;
 
-pub fn prompt_plan(tech: &str, target_hours: i64, minutes_per_day: i64) -> String {
+/// `builds_on` is the subjects the learner already cleared earlier on their
+/// roadmap. Naming them is what keeps a track coherent: Spring Boot should
+/// lean on the Java already done rather than teach it again.
+pub fn prompt_plan(
+    tech: &str,
+    target_hours: i64,
+    minutes_per_day: i64,
+    builds_on: &[String],
+) -> String {
     let day_count = day_count(target_hours, minutes_per_day);
+    let prior = if builds_on.is_empty() {
+        "This is the first subject on the learner's track, so assume no ground \
+         has been covered yet."
+            .to_string()
+    } else {
+        format!(
+            "The learner has already worked through these subjects on the same track, in \
+             this order: {}. Treat that as known ground - build directly on it, say \
+             explicitly where {tech} extends or depends on it, and do not spend days \
+             re-teaching it.",
+            builds_on.join(", ")
+        )
+    };
     PLAN_PROMPT
         .replace("{TECH}", tech)
         .replace("{MINUTES_PER_DAY}", &minutes_per_day.to_string())
         .replace("{TARGET_HOURS}", &target_hours.to_string())
         .replace("{DAY_COUNT}", &day_count.to_string())
+        .replace("{PRIOR_SUBJECTS}", &prior)
 }
 
 /// Days in a plan: ceil(target_hours * 60 / minutes_per_day).
@@ -371,9 +398,10 @@ pub fn spawn_plan(
     tech: String,
     target_hours: i64,
     minutes_per_day: i64,
+    builds_on: Vec<String>,
 ) {
     std::thread::spawn(move || {
-        let prompt = prompt_plan(&tech, target_hours, minutes_per_day);
+        let prompt = prompt_plan(&tech, target_hours, minutes_per_day, &builds_on);
         let result = match cli_json::<PlanJson>(&cfg, &prompt) {
             Ok((mut plan, raw)) => {
                 enforce_ramp(&mut plan);
@@ -424,6 +452,16 @@ pub fn spawn_quiz(
             week_number,
             outcome,
         });
+    });
+}
+
+/// A cheap round trip so a misconfigured path surfaces before a long job.
+pub fn spawn_cli_test(tx: Sender<JobResult>, cfg: CliConfig) {
+    std::thread::spawn(move || {
+        let outcome = run_cli(&cfg, "Reply with the single word: ready", None)
+            .map(|out| out.trim().chars().take(60).collect::<String>())
+            .map_err(|e| e.to_string());
+        let _ = tx.send(JobResult::CliTest { outcome });
     });
 }
 
@@ -500,6 +538,31 @@ The `{}` placeholder in Foo.java is wrong.
         assert_eq!(day_count(20, 90), 14);
         assert_eq!(day_count(20, 45), 27);
     }
+
+    #[test]
+    fn a_plan_prompt_names_what_the_track_already_cleared() {
+        let first = prompt_plan("Java", 20, 60, &[]);
+        assert!(
+            first.contains("first subject on the learner"),
+            "a track opener says there is no prior ground"
+        );
+        assert!(!first.contains("already worked through"));
+
+        let later = prompt_plan(
+            "Spring Boot",
+            20,
+            60,
+            &["Java".to_string(), "MySQL".to_string()],
+        );
+        assert!(
+            later.contains("Java, MySQL"),
+            "earlier subjects are listed in track order"
+        );
+        assert!(
+            later.contains("do not spend days"),
+            "and the course is told not to re-teach them"
+        );
+    }
 }
 
 /// Exercises the real `claude` binary end to end: prompt -> CLI -> JSON ->
@@ -513,7 +576,7 @@ mod cli_integration {
     #[ignore]
     fn plan_prompt_round_trips_through_the_real_cli() {
         let cfg = CliConfig::default();
-        let prompt = prompt_plan("Redis", 4, 60);
+        let prompt = prompt_plan("Redis", 4, 60, &[]);
         let raw = run_cli(&cfg, &prompt, None).expect("claude CLI ran");
         let slice = extract_json(&raw).expect("a JSON object in the reply");
         let mut plan: PlanJson = serde_json::from_str(slice).expect("parses as a plan");

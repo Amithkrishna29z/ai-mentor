@@ -5,7 +5,13 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 // Row models
 // ---------------------------------------------------------------------------
+//
+// These mirror their tables column for column, so a struct can carry a column
+// no view reads yet (a foreign key the query already joined on, say). That is
+// the shape being faithful to the schema, not an oversight, hence the
+// `dead_code` allowances below; a genuinely new unused field still warns.
 
+#[allow(dead_code)] // mirrors the table row
 #[derive(Debug, Clone)]
 pub struct TechStack {
     pub id: i64,
@@ -14,6 +20,7 @@ pub struct TechStack {
     pub is_custom: bool,
 }
 
+#[allow(dead_code)] // mirrors the table row
 #[derive(Debug, Clone)]
 pub struct Plan {
     pub id: i64,
@@ -56,6 +63,7 @@ impl DayStatus {
     }
 }
 
+#[allow(dead_code)] // mirrors the table row
 #[derive(Debug, Clone)]
 pub struct Day {
     pub id: i64,
@@ -85,6 +93,7 @@ pub struct InterviewQuestion {
     pub key_points: Vec<String>,
 }
 
+#[allow(dead_code)] // mirrors the table row
 #[derive(Debug, Clone)]
 pub struct WeeklyProject {
     pub id: i64,
@@ -98,6 +107,7 @@ pub struct WeeklyProject {
     pub notes: String,
 }
 
+#[allow(dead_code)] // mirrors the table row
 #[derive(Debug, Clone)]
 pub struct Verification {
     pub id: i64,
@@ -133,6 +143,7 @@ pub struct Roadmap {
     pub active: bool,
 }
 
+#[allow(dead_code)] // mirrors the table row
 #[derive(Debug, Clone)]
 pub struct RoadmapItem {
     pub id: i64,
@@ -142,6 +153,7 @@ pub struct RoadmapItem {
     pub position: i64,
 }
 
+#[allow(dead_code)] // mirrors the table row
 #[derive(Debug, Clone)]
 pub struct Quiz {
     pub id: i64,
@@ -151,6 +163,7 @@ pub struct Quiz {
     pub week_number: Option<i64>,
 }
 
+#[allow(dead_code)] // mirrors the table row
 #[derive(Debug, Clone)]
 pub struct QuizQuestion {
     pub id: i64,
@@ -161,6 +174,7 @@ pub struct QuizQuestion {
     pub explanation: String,
 }
 
+#[allow(dead_code)] // mirrors the table row
 #[derive(Debug, Clone)]
 pub struct ReviewCard {
     pub id: i64,

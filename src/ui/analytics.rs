@@ -244,21 +244,27 @@ fn subject_table(app: &mut AiMentorApp, ui: &mut egui::Ui) {
             }
             ui.end_row();
 
-            for (name, done, total, minutes, target_hours) in rows {
-                ui.label(name);
+            for row in rows {
+                ui.label(row.name);
                 ui.label(
-                    egui::RichText::new(format!("{done}/{total}")).monospace().size(12.5),
+                    egui::RichText::new(format!("{}/{}", row.days_done, row.days_total))
+                        .monospace()
+                        .size(12.5),
                 );
                 ui.label(
                     egui::RichText::new(format!(
                         "{:.1} / {} h",
-                        minutes as f32 / 60.0,
-                        target_hours
+                        row.logged_minutes as f32 / 60.0,
+                        row.target_hours
                     ))
                     .monospace()
                     .size(12.5),
                 );
-                let fraction = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+                let fraction = if row.days_total > 0 {
+                    row.days_done as f32 / row.days_total as f32
+                } else {
+                    0.0
+                };
                 ui.add(
                     egui::ProgressBar::new(fraction)
                         .desired_width(150.0)

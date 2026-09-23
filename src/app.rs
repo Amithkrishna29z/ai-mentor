@@ -1,6 +1,6 @@
 //! Application state, background-job plumbing and the eframe update loop.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use egui_commonmark::CommonMarkCache;
@@ -8,7 +8,7 @@ use egui_commonmark::CommonMarkCache;
 use crate::db::{self, Db};
 use crate::mentor::{self, CliConfig, JobResult};
 use crate::models::*;
-use crate::{quiz, srs, ui, verify};
+use crate::{quiz, roadmap, srs, timer, ui, verify};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -54,6 +54,8 @@ pub enum QueuedJob {
         tech: String,
         target_hours: i64,
         minutes_per_day: i64,
+        /// Subjects already cleared earlier on the track.
+        builds_on: Vec<String>,
     },
     DayContent {
         day_id: i64,
@@ -133,12 +135,21 @@ pub struct AiMentorApp {
     /// Raw CLI output kept for manual repair when JSON parsing failed.
     pub failed_plan_raw: Option<(i64, String)>,
 
+    /// The active track, rebuilt when its data changes rather than every
+    /// frame: `roadmap::progress` costs two queries per subject, and two
+    /// views were each asking for it on every repaint.
+    pub track: Option<roadmap::RoadmapProgress>,
+    /// Subjects that already have a course, for the list markers.
+    pub stacks_with_plans: HashSet<i64>,
+
     pub due_cards: Vec<ReviewCard>,
     pub review_index: usize,
     pub review_revealed: bool,
     pub reviewed_today: i64,
 
     pub quiz: Option<QuizState>,
+    /// The running practice session, if one was started.
+    pub timer: Option<timer::PracticeTimer>,
 
     pub show_settings: bool,
     pub settings_form: SettingsForm,
@@ -150,6 +161,8 @@ pub struct AiMentorApp {
     pub update_available: Option<crate::update::ReleaseInfo>,
     pub update_installed: Option<String>,
     pub checking_update: bool,
+    pub testing_cli: bool,
+    size_fitted: bool,
     last_size_save: f64,
 }
 
@@ -213,11 +226,14 @@ impl AiMentorApp {
             github_input: String::new(),
             issue_filter: "all".to_string(),
             failed_plan_raw: None,
+            track: None,
+            stacks_with_plans: HashSet::new(),
             due_cards: Vec::new(),
             review_index: 0,
             review_revealed: false,
             reviewed_today: 0,
             quiz: None,
+            timer: None,
             show_settings: false,
             settings_form,
             md_cache: CommonMarkCache::default(),
@@ -226,6 +242,8 @@ impl AiMentorApp {
             update_available: None,
             update_installed: None,
             checking_update: false,
+            testing_cli: false,
+            size_fitted: false,
             last_size_save: 0.0,
         };
         app.reload_subject();
@@ -240,6 +258,24 @@ impl AiMentorApp {
 
     pub fn reload_stacks(&mut self) {
         self.stacks = self.db.all_stacks().unwrap_or_default();
+        self.reload_track();
+    }
+
+    /// Recompute the cached track snapshot. Call after anything that moves a
+    /// day's status, a plan, or the roadmap itself.
+    pub fn reload_track(&mut self) {
+        self.track = self
+            .db
+            .roadmaps()
+            .ok()
+            .and_then(|rs| rs.into_iter().find(|r| r.active))
+            .and_then(|r| roadmap::progress(&self.db, r.id).ok());
+        self.stacks_with_plans = self
+            .db
+            .stacks_with_plans()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
     }
 
     pub fn reload_subject(&mut self) {
@@ -264,6 +300,7 @@ impl AiMentorApp {
         }
         self.sync_day_buffers();
         self.reload_verifications();
+        self.reload_track();
     }
 
     pub fn reload_due_cards(&mut self) {
@@ -346,6 +383,7 @@ impl AiMentorApp {
                     tech,
                     target_hours,
                     minutes_per_day,
+                    builds_on,
                 } => mentor::spawn_plan(
                     self.tx.clone(),
                     self.cfg.clone(),
@@ -353,6 +391,7 @@ impl AiMentorApp {
                     tech,
                     target_hours,
                     minutes_per_day,
+                    builds_on,
                 ),
                 QueuedJob::DayContent { day_id, prompt } => {
                     mentor::spawn_day_content(self.tx.clone(), self.cfg.clone(), day_id, prompt)
@@ -434,11 +473,13 @@ impl AiMentorApp {
             if matches!(self.db.plan_for_stack(id), Ok(Some(_))) {
                 continue; // keep existing plans; use Regenerate to replace one
             }
+            let builds_on = self.track_context(id);
             self.queue.push_back(QueuedJob::Plan {
                 stack_id: id,
                 tech: name,
                 target_hours,
                 minutes_per_day,
+                builds_on,
             });
             launched += 1;
         }
@@ -456,9 +497,46 @@ impl AiMentorApp {
             tech: tech.clone(),
             target_hours: self.settings_form.target_hours,
             minutes_per_day: self.settings_form.minutes_per_day,
+            builds_on: self.track_context(stack_id),
         };
         self.enqueue(job);
         self.status = format!("Generating the {tech} course…");
+    }
+
+    // -- the roadmap track -------------------------------------------------
+
+    /// Subjects already cleared ahead of this one on the active track. A new
+    /// course is told about them so it builds on that ground instead of
+    /// starting the learner over.
+    fn track_context(&self, stack_id: i64) -> Vec<String> {
+        let Some(progress) = self.track.as_ref() else {
+            return Vec::new();
+        };
+        match progress.index_of(stack_id) {
+            Some(idx) => progress.cleared_before(idx),
+            None => Vec::new(),
+        }
+    }
+
+    /// Move to whatever the track says comes next: select that subject, and
+    /// generate its course if it does not have one yet.
+    pub fn start_next_on_track(&mut self) {
+        let Some(progress) = self.track.as_ref() else {
+            self.status = "No roadmap is active.".to_string();
+            return;
+        };
+        let Some(entry) = progress.current_entry() else {
+            self.status = "Every subject on the track is cleared.".to_string();
+            return;
+        };
+        let (stack_id, subject) = (entry.stack_id, entry.subject.clone());
+        self.select_subject(stack_id);
+        self.tab = Tab::Study;
+        if matches!(self.db.plan_for_stack(stack_id), Ok(Some(_))) {
+            self.status = format!("{subject}: picking up where the track left off.");
+        } else {
+            self.regenerate_plan(stack_id, subject);
+        }
     }
 
     pub fn fetch_day_content(&mut self, day_id: i64) {
@@ -595,6 +673,53 @@ impl AiMentorApp {
         }
     }
 
+    // -- the practice timer ------------------------------------------------
+
+    pub fn start_timer(&mut self, day_id: i64, now: f64) {
+        self.timer = Some(timer::PracticeTimer::started(day_id, now));
+        self.status = "Practice timer running.".to_string();
+    }
+
+    pub fn toggle_timer(&mut self, now: f64) {
+        let Some(session) = self.timer.as_mut() else {
+            return;
+        };
+        if session.is_running() {
+            session.pause(now);
+            self.status = "Practice timer paused.".to_string();
+        } else {
+            session.resume(now);
+            self.status = "Practice timer running.".to_string();
+        }
+    }
+
+    /// Stop the timer and log its minutes against the day it was started on,
+    /// which is not necessarily the day on screen now.
+    pub fn stop_timer(&mut self, now: f64) {
+        let Some(session) = self.timer.take() else {
+            return;
+        };
+        let minutes = session.minutes(now);
+        if minutes < 1 {
+            self.status = "Timer stopped - under a minute, so nothing was logged.".to_string();
+            return;
+        }
+        if let Err(e) = self.db.log_minutes(session.day_id, minutes) {
+            self.error = Some(e.to_string());
+            return;
+        }
+        // Practising implies the day has started, exactly as a manual log does.
+        if self
+            .days
+            .iter()
+            .any(|d| d.id == session.day_id && d.status == DayStatus::NotStarted)
+        {
+            let _ = self.db.set_day_status(session.day_id, DayStatus::InProgress);
+        }
+        self.status = format!("Logged {minutes} min of practice.");
+        self.reload_subject();
+    }
+
     /// Import plan JSON the user pasted or fixed by hand.
     pub fn import_plan_json(&mut self, stack_id: i64, raw: &str) {
         let parsed = mentor::extract_json(raw)
@@ -653,7 +778,9 @@ impl AiMentorApp {
             self.jobs_in_flight = self.jobs_in_flight.saturating_sub(1);
             if !matches!(
                 result,
-                JobResult::UpdateCheck { .. } | JobResult::UpdateInstall { .. }
+                JobResult::UpdateCheck { .. }
+                    | JobResult::UpdateInstall { .. }
+                    | JobResult::CliTest { .. }
             ) {
                 finished_cli += 1;
             }
@@ -722,23 +849,29 @@ impl AiMentorApp {
                     report_md,
                     outcome,
                 } => {
-                    let (verdict, score, issues) = match &outcome {
-                        Ok(v) => (v.verdict.clone(), v.score, v.issues.clone()),
-                        Err(_) => ("unknown".to_string(), 0, Vec::new()),
+                    let review = match &outcome {
+                        Ok(v) => v.clone(),
+                        Err(_) => VerificationJson {
+                            verdict: "unknown".to_string(),
+                            ..Default::default()
+                        },
                     };
                     if let Err(e) = self.db.insert_verification(
                         weekly_project_id,
                         &github_url,
                         &commit_sha,
-                        &verdict,
-                        score,
                         &report_md,
-                        &issues,
+                        &review,
                     ) {
                         self.error = Some(e.to_string());
                     }
                     match outcome {
-                        Ok(_) => self.status = format!("Review complete: {verdict} ({score}/100)."),
+                        Ok(_) => {
+                            self.status = format!(
+                                "Review complete: {} ({}/100).",
+                                review.verdict, review.score
+                            )
+                        }
                         Err(e) => {
                             self.status = "Review finished with problems.".to_string();
                             self.error = Some(e);
@@ -759,6 +892,19 @@ impl AiMentorApp {
                                 format!("AI Mentor {} is up to date.", crate::update::current_version());
                         }
                         Err(e) => self.error = Some(format!("Update check failed: {e}")),
+                    }
+                }
+                JobResult::CliTest { outcome } => {
+                    self.testing_cli = false;
+                    match outcome {
+                        Ok(reply) => {
+                            self.status = format!("CLI replied: {reply}");
+                            self.error = None;
+                        }
+                        Err(e) => {
+                            self.status = "The Claude CLI could not be run.".to_string();
+                            self.error = Some(e);
+                        }
                     }
                 }
                 JobResult::UpdateInstall { outcome } => match outcome {
@@ -792,6 +938,19 @@ impl AiMentorApp {
         self.checking_update = true;
         self.jobs_in_flight += 1;
         crate::update::spawn_check(self.tx.clone());
+    }
+
+    /// Check the CLI on a worker like every other CLI call: running it inline
+    /// froze the window for as long as Claude took to answer. The config comes
+    /// from the settings form, so a path can be tried before it is saved.
+    pub fn test_cli(&mut self, cfg: CliConfig) {
+        if self.testing_cli {
+            return;
+        }
+        self.testing_cli = true;
+        self.jobs_in_flight += 1;
+        self.status = "Testing the Claude CLI…".to_string();
+        mentor::spawn_cli_test(self.tx.clone(), cfg);
     }
 
     pub fn install_update(&mut self) {
@@ -830,6 +989,54 @@ impl AiMentorApp {
         self.status = "Settings saved.".to_string();
     }
 
+    /// Shrink the window onto the display if the restored size does not fit.
+    ///
+    /// eframe has its own monitor clamp, but it sizes the monitor with
+    /// `monitor.scale_factor()`, which winit reports as 1.0 here: on a 1920x1200
+    /// display at 150% it believes the screen is 1920 points wide rather than
+    /// 1280, so a 1350-point window sails through unclamped and hangs off the
+    /// edge. egui's own `monitor_size` is reported in points correctly, so do
+    /// the fit here instead - once, on the first frame that reports a monitor.
+    fn fit_to_monitor(&mut self, ctx: &egui::Context) {
+        if self.size_fitted {
+            return;
+        }
+        let (monitor, outer, inner) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.monitor_size, v.outer_rect, v.inner_rect)
+        });
+        let (Some(monitor), Some(inner)) = (monitor, inner) else {
+            return; // not reported yet - try again next frame
+        };
+        if monitor.x <= 1.0 || monitor.y <= 1.0 {
+            return;
+        }
+        self.size_fitted = true;
+
+        // Borders and title bar, plus room for a taskbar along one edge.
+        let chrome = outer.map_or(egui::Vec2::ZERO, |o| o.size() - inner.size());
+        let limit = egui::vec2(monitor.x - chrome.x, monitor.y - chrome.y - 48.0);
+        let size = inner.size();
+        if size.x <= limit.x && size.y <= limit.y {
+            return;
+        }
+
+        let fitted = egui::vec2(
+            size.x.min(limit.x).max(crate::MIN_INNER_SIZE[0]),
+            size.y.min(limit.y).max(crate::MIN_INNER_SIZE[1]),
+        );
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(fitted));
+        // Re-centre for the new size; `center_on_screen` would still be using
+        // the oversized rect this frame.
+        let outer_size = fitted + chrome;
+        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+            egui::pos2(
+                ((monitor.x - outer_size.x) * 0.5).max(0.0),
+                ((monitor.y - outer_size.y) * 0.5).max(0.0),
+            ),
+        ));
+    }
+
     fn persist_window_size(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
         if now - self.last_size_save < 3.0 {
@@ -864,6 +1071,10 @@ impl eframe::App for AiMentorApp {
         if self.jobs_in_flight > 0 {
             ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
+        if self.timer.as_ref().is_some_and(|s| s.is_running()) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        self.fit_to_monitor(ctx);
         self.persist_window_size(ctx);
 
         let t = ui::theme::theme_for(self.dark_mode);
@@ -889,6 +1100,12 @@ impl eframe::App for AiMentorApp {
         egui::Panel::left("subjects")
             .resizable(true)
             .default_size(292.0)
+            // A left panel's range defaults to 96..=INFINITY, so `default_size`
+            // only picks the starting width - one stray drag on the divider can
+            // hand the sidebar half the window and squeeze the lesson off the
+            // screen. egui clamps a stored width to this range when it loads,
+            // so bounding it here also recovers an already-dragged panel.
+            .size_range(240.0..=380.0)
             .frame(
                 egui::Frame::new()
                     .fill(t.plane)
@@ -1032,6 +1249,19 @@ impl AiMentorApp {
                 }
                 ui.add_space(6.0);
             }
+            if let Some(session) = self.timer.as_ref() {
+                let elapsed = session.elapsed(ui.input(|i| i.time));
+                ui::theme::pill(
+                    ui,
+                    format!("{} practice", timer::format_clock(elapsed)),
+                    if session.is_running() {
+                        t.accent
+                    } else {
+                        t.text_muted
+                    },
+                );
+                ui.add_space(6.0);
+            }
             ui.label(
                 egui::RichText::new(&self.status)
                     .color(t.text_weak)
@@ -1063,5 +1293,79 @@ pub fn status_color(status: DayStatus, t: &ui::theme::Theme) -> egui::Color32 {
         DayStatus::NotStarted => t.text_muted,
         DayStatus::InProgress => t.accent,
         DayStatus::Done => t.good,
+    }
+}
+
+/// The timer through the app rather than the state machine: a stopped session
+/// has to reach `study_sessions`, which is what every hour count is built on.
+#[cfg(test)]
+mod timer_logging {
+    use super::*;
+
+    fn app_with_one_day() -> (tempfile::TempDir, AiMentorApp, i64) {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut db = Db::open_at(&tmp.path().join("t.db")).expect("db opens");
+        // Keep the suite offline.
+        db.set_setting("check_updates_on_start", "0").expect("setting");
+
+        let stack_id = db
+            .stack_id_by_name("Redis")
+            .expect("query")
+            .expect("Redis is seeded");
+        let plan = PlanJson {
+            days: vec![DayJson {
+                day: 1,
+                week: 1,
+                difficulty: 1,
+                est_minutes: 60,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let plan_id = db.save_plan(stack_id, 1, 60, &plan, "{}").expect("plan saved");
+        let day_id = db.days_for_plan(plan_id).expect("days")[0].id;
+
+        let mut app = AiMentorApp::new(db);
+        app.select_subject(stack_id);
+        (tmp, app, day_id)
+    }
+
+    #[test]
+    fn stopping_the_timer_logs_its_minutes_and_starts_the_day() {
+        let (_tmp, mut app, day_id) = app_with_one_day();
+        assert_eq!(app.db.logged_minutes_for_day(day_id).unwrap(), 0);
+
+        app.start_timer(day_id, 0.0);
+        app.stop_timer(25.0 * 60.0);
+
+        assert_eq!(app.db.logged_minutes_for_day(day_id).unwrap(), 25);
+        assert!(app.timer.is_none(), "the timer is cleared once logged");
+        let day = app.days.iter().find(|d| d.id == day_id).expect("day reloaded");
+        assert_eq!(
+            day.status,
+            DayStatus::InProgress,
+            "practising a not-started day starts it"
+        );
+    }
+
+    #[test]
+    fn paused_time_is_not_logged() {
+        let (_tmp, mut app, day_id) = app_with_one_day();
+        app.start_timer(day_id, 0.0);
+        app.toggle_timer(600.0); // pause after 10 min
+        app.toggle_timer(3000.0); // resume 40 min later
+        app.stop_timer(3300.0); // and run 5 min more
+
+        assert_eq!(app.db.logged_minutes_for_day(day_id).unwrap(), 15);
+    }
+
+    #[test]
+    fn a_session_under_a_minute_logs_nothing() {
+        let (_tmp, mut app, day_id) = app_with_one_day();
+        app.start_timer(day_id, 0.0);
+        app.stop_timer(20.0);
+
+        assert_eq!(app.db.logged_minutes_for_day(day_id).unwrap(), 0);
+        assert!(app.timer.is_none(), "a discarded session still clears");
     }
 }

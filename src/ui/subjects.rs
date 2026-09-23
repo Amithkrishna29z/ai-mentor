@@ -2,7 +2,6 @@
 
 use crate::app::{AiMentorApp, Tab};
 use crate::models::{category_of, CATEGORY_ORDER};
-use crate::roadmap;
 use crate::ui::theme;
 
 pub fn show(app: &mut AiMentorApp, ui: &mut egui::Ui) {
@@ -27,7 +26,9 @@ fn actions(app: &mut AiMentorApp, ui: &mut egui::Ui) {
     let t = theme::current(ui);
     let width = ui.available_width();
 
-    let due = app.db.due_card_count(&crate::db::today()).unwrap_or(0);
+    // What is left in the queue the Reviews tab is showing, not a fresh count
+    // per frame.
+    let due = app.due_cards.len().saturating_sub(app.review_index);
     let reviews = egui::Button::new(if due > 0 {
         egui::RichText::new(format!("Today's reviews · {due} due"))
             .color(t.text)
@@ -127,8 +128,8 @@ fn subject_list(app: &mut AiMentorApp, ui: &mut egui::Ui) {
                                 app.select_subject(id);
                                 app.tab = Tab::Study;
                             }
-                            if matches!(app.db.plan_for_stack(id), Ok(Some(_))) {
-                                ui.label(egui::RichText::new("●").size(8.0).color(t.good))
+                            if app.stacks_with_plans.contains(&id) {
+                                ui.label(egui::RichText::new("⏺").size(8.0).color(t.good))
                                     .on_hover_text("plan generated");
                             }
                         });
@@ -156,14 +157,15 @@ fn roadmap_selector(app: &mut AiMentorApp, ui: &mut egui::Ui) {
             for r in &roadmaps {
                 if ui.selectable_label(r.active, &r.name).clicked() && !r.active {
                     let _ = app.db.set_active_roadmap(r.id);
+                    app.reload_track();
                 }
             }
         });
 
-    let Some(active) = active else {
+    if active.is_none() {
         return;
-    };
-    let Ok(progress) = roadmap::progress(&app.db, active.id) else {
+    }
+    let Some(progress) = app.track.clone() else {
         return;
     };
 
@@ -182,36 +184,48 @@ fn roadmap_selector(app: &mut AiMentorApp, ui: &mut egui::Ui) {
         .id_salt("roadmap_items")
         .max_height(row_height * 4.0)
         .show(ui, |ui| {
-            for (idx, (_, name, stack_id, done, total, unlocked)) in
-                progress.items.iter().enumerate()
-            {
+            for (idx, entry) in progress.entries.iter().enumerate() {
                 let is_current = progress.current == Some(idx);
                 ui.horizontal(|ui| {
                     let (marker, colour) = if is_current {
-                        ("▶", t.accent)
-                    } else if *unlocked {
-                        ("●", t.good)
+                        ("⏵", t.accent)
+                    } else if entry.cleared {
+                        ("⏺", t.good)
+                    } else if entry.unlocked {
+                        ("⏺", t.text_weak)
                     } else {
                         ("○", t.text_muted)
                     };
                     ui.label(egui::RichText::new(marker).size(9.0).color(colour));
-                    let active = app.active_stack == Some(*stack_id);
+
+                    let active = app.active_stack == Some(entry.stack_id);
                     let text = if active {
-                        egui::RichText::new(name).color(t.text).strong()
+                        egui::RichText::new(&entry.subject).color(t.text).strong()
                     } else {
-                        egui::RichText::new(name).color(t.text_weak)
+                        egui::RichText::new(&entry.subject).color(t.text_weak)
                     };
-                    if ui.selectable_label(active, text).clicked() {
-                        app.select_subject(*stack_id);
-                        app.tab = Tab::Study;
+                    // Locked subjects stay unreachable from the track itself.
+                    if entry.unlocked {
+                        if ui.selectable_label(active, text).clicked() {
+                            app.select_subject(entry.stack_id);
+                            app.tab = Tab::Study;
+                        }
+                    } else {
+                        ui.add_enabled_ui(false, |ui| ui.selectable_label(active, text))
+                            .inner
+                            .on_disabled_hover_text("Clear the subjects above it first");
                     }
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if *total > 0 {
+                        if entry.days_total > 0 {
                             ui.label(
-                                egui::RichText::new(format!("{done}/{total}"))
-                                    .size(10.5)
-                                    .color(t.text_muted)
-                                    .monospace(),
+                                egui::RichText::new(format!(
+                                    "{}/{}",
+                                    entry.days_done, entry.days_total
+                                ))
+                                .size(10.5)
+                                .color(t.text_muted)
+                                .monospace(),
                             );
                         }
                     });
