@@ -282,6 +282,29 @@ pub struct QuizQuestionJson {
     pub explanation: String,
 }
 
+/// What a job posting asks for, as the CLI reads it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JobSpecJson {
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub seniority: String,
+    #[serde(default)]
+    pub skills: Vec<JobSkillJson>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct JobSkillJson {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub why: String,
+    #[serde(default)]
+    pub priority: i64,
+    #[serde(default)]
+    pub must_have: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VerificationJson {
     #[serde(default)]

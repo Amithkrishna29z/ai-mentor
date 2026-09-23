@@ -112,11 +112,15 @@ fn subject_list(app: &mut AiMentorApp, ui: &mut egui::Ui) {
                     for (id, name, selected) in rows {
                         ui.horizontal(|ui| {
                             let mut checked = selected;
-                            if ui.checkbox(&mut checked, "").changed() {
-                                if let Err(e) = app.db.set_stack_selected(id, checked) {
-                                    app.error = Some(e.to_string());
-                                }
-                                app.reload_stacks();
+                            if ui
+                                .checkbox(&mut checked, "")
+                                .on_hover_text(
+                                    "On my track. Ticking adds it to the end; unticking \
+                                     takes it off and keeps the course.",
+                                )
+                                .changed()
+                            {
+                                app.set_on_track(id, checked);
                             }
                             let is_active = app.active_stack == Some(id);
                             let text = if is_active {

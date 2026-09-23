@@ -29,6 +29,19 @@ impl Default for CliConfig {
     }
 }
 
+/// Everything one course generation needs. A struct rather than another
+/// positional argument, matching `verify::VerifyRequest`.
+pub struct PlanRequest {
+    pub stack_id: i64,
+    pub tech: String,
+    pub target_hours: i64,
+    pub minutes_per_day: i64,
+    /// Subjects already cleared earlier on the track.
+    pub builds_on: Vec<String>,
+    /// The job the learner is training for; empty when none is set.
+    pub role: String,
+}
+
 /// Results handed back to the UI thread from background jobs.
 pub enum JobResult {
     Plan {
@@ -63,6 +76,9 @@ pub enum JobResult {
     },
     CliTest {
         outcome: std::result::Result<String, String>,
+    },
+    JobSkills {
+        outcome: std::result::Result<JobSpecJson, String>,
     },
 }
 
@@ -214,6 +230,8 @@ const PLAN_PROMPT: &str = r#"You are a technical mentor applying Josh Kaufman's 
 
 {PRIOR_SUBJECTS}
 
+{TARGET_ROLE}
+
 Hard requirements: (1) "difficulty" (1-5) must be non-decreasing day over day - start foundational, end at interview/systems level. Week 1 = foundation (1-2), week 2 = applied/integration (2-3), week 3 = advanced/edge-cases (4), final days = interview-grade/systems (5). (2) From Week 2 onward each day must reuse earlier subskills - list them in "builds_on" - so complexity compounds instead of resetting. (3) Every day's "practice_task" is a concrete coding/build task, never "read about X". (4) Every day includes 2-4 realistic "interview_questions" with the key points of a strong answer. (5) Weekly projects grow in scope week over week.
 
 Output ONLY valid JSON matching this schema, nothing else:
@@ -238,8 +256,22 @@ pub fn prompt_plan(
     target_hours: i64,
     minutes_per_day: i64,
     builds_on: &[String],
+    role: &str,
 ) -> String {
     let day_count = day_count(target_hours, minutes_per_day);
+    let target = if role.trim().is_empty() {
+        "The learner has not named a target role, so aim at general professional \
+         competence and the interviews that go with it."
+            .to_string()
+    } else {
+        format!(
+            "The learner is training to be hired as: {}. Choose the subskills, the weekly \
+             projects and the interview questions that this role is actually hired to do - \
+             what a real interview for it would probe, and what the job would have them build \
+             in their first months. Skip anything that would not come up.",
+            role.trim()
+        )
+    };
     let prior = if builds_on.is_empty() {
         "This is the first subject on the learner's track, so assume no ground \
          has been covered yet."
@@ -259,6 +291,36 @@ pub fn prompt_plan(
         .replace("{TARGET_HOURS}", &target_hours.to_string())
         .replace("{DAY_COUNT}", &day_count.to_string())
         .replace("{PRIOR_SUBJECTS}", &prior)
+        .replace("{TARGET_ROLE}", &target)
+}
+
+const JOB_PROMPT: &str = r#"Read this job posting and work out what somebody would have to learn to be hired for it.
+
+Output ONLY valid JSON matching this schema, nothing else:
+{
+  "role": string,
+  "seniority": string,
+  "skills": [ { "name": string, "why": string, "priority": number, "must_have": boolean } ]
+}
+
+Rules: "role" is the job title, normalised (e.g. "Java Backend Developer"). "seniority" is one of intern, junior, mid, senior. Each "name" is the bare technology or subject on its own - "Spring Boot", never "strong Spring Boot experience". Order "skills" in the order they should be learned: foundations first, then what depends on them; "priority" counts up from 1 in that same order. Set "must_have" true only where the posting treats the skill as required rather than nice to have. Return at most 12 skills - the ones that actually decide whether somebody gets this job. "why" is one line on what the role uses it for.
+
+The posting follows.
+---
+{JOB_DESCRIPTION}"#;
+
+pub fn prompt_job_skills(description: &str) -> String {
+    JOB_PROMPT.replace("{JOB_DESCRIPTION}", description.trim())
+}
+
+/// Read a job posting into a skill list on a worker thread.
+pub fn spawn_job_skills(tx: Sender<JobResult>, cfg: CliConfig, description: String) {
+    std::thread::spawn(move || {
+        let outcome = cli_json::<JobSpecJson>(&cfg, &prompt_job_skills(&description))
+            .map(|(spec, _)| spec)
+            .map_err(|(e, _)| e);
+        let _ = tx.send(JobResult::JobSkills { outcome });
+    });
 }
 
 /// Days in a plan: ceil(target_hours * 60 / minutes_per_day).
@@ -391,17 +453,17 @@ pub fn week_subskills(days: &[Day], week: i64) -> String {
 // Background jobs
 // ---------------------------------------------------------------------------
 
-pub fn spawn_plan(
-    tx: Sender<JobResult>,
-    cfg: CliConfig,
-    stack_id: i64,
-    tech: String,
-    target_hours: i64,
-    minutes_per_day: i64,
-    builds_on: Vec<String>,
-) {
+pub fn spawn_plan(tx: Sender<JobResult>, cfg: CliConfig, req: PlanRequest) {
     std::thread::spawn(move || {
-        let prompt = prompt_plan(&tech, target_hours, minutes_per_day, &builds_on);
+        let PlanRequest {
+            stack_id,
+            tech,
+            target_hours,
+            minutes_per_day,
+            builds_on,
+            role,
+        } = req;
+        let prompt = prompt_plan(&tech, target_hours, minutes_per_day, &builds_on, &role);
         let result = match cli_json::<PlanJson>(&cfg, &prompt) {
             Ok((mut plan, raw)) => {
                 enforce_ramp(&mut plan);
@@ -540,8 +602,35 @@ The `{}` placeholder in Foo.java is wrong.
     }
 
     #[test]
+    fn the_plan_prompt_names_the_job_being_trained_for() {
+        let unaimed = prompt_plan("Java", 20, 60, &[], "");
+        assert!(
+            unaimed.contains("not named a target role"),
+            "with no role it still says so rather than leaving a placeholder"
+        );
+        assert!(!unaimed.contains("{TARGET_ROLE}"));
+
+        let aimed = prompt_plan("Java", 20, 60, &[], "  Java Backend Developer  ");
+        assert!(
+            aimed.contains("hired as: Java Backend Developer"),
+            "the role is named, trimmed"
+        );
+    }
+
+    #[test]
+    fn the_job_prompt_carries_the_posting_and_asks_for_json() {
+        let prompt = prompt_job_skills("  We need Java and Spring Boot.  ");
+        assert!(prompt.contains("We need Java and Spring Boot."));
+        assert!(prompt.contains("must_have"), "the schema is spelled out");
+        assert!(
+            !prompt.contains("{JOB_DESCRIPTION}"),
+            "the placeholder is filled in"
+        );
+    }
+
+    #[test]
     fn a_plan_prompt_names_what_the_track_already_cleared() {
-        let first = prompt_plan("Java", 20, 60, &[]);
+        let first = prompt_plan("Java", 20, 60, &[], "");
         assert!(
             first.contains("first subject on the learner"),
             "a track opener says there is no prior ground"
@@ -553,6 +642,7 @@ The `{}` placeholder in Foo.java is wrong.
             20,
             60,
             &["Java".to_string(), "MySQL".to_string()],
+            "",
         );
         assert!(
             later.contains("Java, MySQL"),
@@ -576,7 +666,7 @@ mod cli_integration {
     #[ignore]
     fn plan_prompt_round_trips_through_the_real_cli() {
         let cfg = CliConfig::default();
-        let prompt = prompt_plan("Redis", 4, 60, &[]);
+        let prompt = prompt_plan("Redis", 4, 60, &[], "");
         let raw = run_cli(&cfg, &prompt, None).expect("claude CLI ran");
         let slice = extract_json(&raw).expect("a JSON object in the reply");
         let mut plan: PlanJson = serde_json::from_str(slice).expect("parses as a plan");
@@ -599,6 +689,62 @@ mod cli_integration {
             plan.days.len(),
             difficulties,
             plan.weekly_projects.len()
+        );
+    }
+}
+
+/// The job-posting path against the real `claude` binary: posting -> skills
+/// JSON -> subjects this app can actually teach. Ignored by default; run with
+/// `cargo test -- --ignored --nocapture a_job_posting`.
+#[cfg(test)]
+mod job_integration {
+    use super::*;
+    use crate::job;
+    use crate::models::CATALOGUE;
+
+    const POSTING: &str = "Backend Engineer (Java) - Bengaluru, hybrid\n\nWe are looking for a backend engineer to join the payments platform team. You will design and ship REST services that move real money, and own them in production.\n\nWhat you will do:\n- Build and maintain microservices in Java 17 and Spring Boot 3\n- Model and query data in PostgreSQL, and keep queries fast under load\n- Cache hot paths with Redis and publish events to Kafka\n- Containerise services with Docker and ship them to Kubernetes\n- Keep the CI/CD pipeline green in GitHub Actions\n\nWhat we are looking for:\n- 2+ years of professional Java, strong OOP and collections\n- Solid grasp of data structures and algorithms\n- Experience with Hibernate/JPA\n- Comfortable on Linux and with Git\n- Nice to have: gRPC, AWS, observability tooling";
+
+    #[test]
+    #[ignore]
+    fn a_job_posting_becomes_subjects_this_app_can_teach() {
+        let cfg = CliConfig::default();
+        let raw = run_cli(&cfg, &prompt_job_skills(POSTING), None).expect("claude CLI ran");
+        let slice = extract_json(&raw).expect("a JSON object in the reply");
+        let spec: JobSpecJson = serde_json::from_str(slice).expect("parses as a job spec");
+
+        println!("role      : {} ({})", spec.role, spec.seniority);
+        println!("skills    : {}", spec.skills.len());
+        assert!(!spec.role.trim().is_empty(), "the posting has a role");
+        assert!(!spec.skills.is_empty(), "and named skills");
+        assert!(spec.skills.len() <= 12, "capped at 12, got {}", spec.skills.len());
+
+        let known: Vec<String> = CATALOGUE
+            .iter()
+            .flat_map(|(_, names)| names.iter().map(|n| (*n).to_string()))
+            .collect();
+
+        let mut ordered = spec.skills.clone();
+        ordered.sort_by_key(|s| s.priority);
+        let mut matched = 0;
+        for skill in &ordered {
+            match job::match_subject(&skill.name, &known) {
+                Some(subject) => {
+                    matched += 1;
+                    println!("  {:>2}. {:28} -> {}", skill.priority, skill.name, subject);
+                }
+                None => println!(
+                    "  {:>2}. {:28} -> (custom: {})",
+                    skill.priority,
+                    skill.name,
+                    job::custom_subject_name(&skill.name)
+                ),
+            }
+        }
+        assert!(
+            matched * 2 >= ordered.len(),
+            "most of a mainstream Java posting should map onto the catalogue, \
+             matched {matched} of {}",
+            ordered.len()
         );
     }
 }

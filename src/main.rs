@@ -6,6 +6,7 @@ mod analytics;
 mod app;
 mod db;
 mod github;
+mod job;
 mod mentor;
 mod models;
 mod quiz;
