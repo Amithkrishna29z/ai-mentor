@@ -22,7 +22,7 @@ pub fn show(app: &mut AiMentorApp, ui: &mut egui::Ui) {
     let Some(card) = app.due_cards.get(app.review_index).cloned() else {
         ui.add_space(42.0);
         ui.vertical_centered(|ui| {
-            ui.label(egui::RichText::new("\u{2714}").size(28.0).color(t.good));
+            ui.label(egui::RichText::new("\u{2714}").size(28.0).monospace().color(t.good));
             ui.add_space(6.0);
             ui.label(egui::RichText::new("Nothing due right now.").size(15.0).strong());
             ui.label(

@@ -425,10 +425,8 @@ impl Db {
         wp_id: i64,
         github_url: &str,
         commit_sha: &str,
-        verdict: &str,
-        score: i64,
         report_md: &str,
-        issues: &[Issue],
+        review: &VerificationJson,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO project_verifications (weekly_project_id, github_url, commit_sha,
@@ -438,10 +436,10 @@ impl Db {
                 wp_id,
                 github_url,
                 commit_sha,
-                verdict,
-                score,
+                review.verdict,
+                review.score,
                 report_md,
-                to_json(&issues),
+                to_json(&review.issues),
                 now()
             ],
         )?;
@@ -794,8 +792,8 @@ impl Db {
 
     // -- cross-subject stats ----------------------------------------------
 
-    /// `(subject, days_done, days_total, logged_minutes, target_hours)` per plan.
-    pub fn subject_progress(&self) -> Result<Vec<(String, i64, i64, i64, i64)>> {
+    /// Progress of every subject that has a plan, for the analytics table.
+    pub fn subject_progress(&self) -> Result<Vec<SubjectProgress>> {
         let mut stmt = self.conn.prepare(
             "SELECT ts.name,
                     SUM(CASE WHEN d.status = 'done' THEN 1 ELSE 0 END),
@@ -810,14 +808,24 @@ impl Db {
         )?;
         let rows = stmt
             .query_map([], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                ))
+                Ok(SubjectProgress {
+                    name: r.get(0)?,
+                    days_done: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    days_total: r.get(2)?,
+                    logged_minutes: r.get(3)?,
+                    target_hours: r.get(4)?,
+                })
             })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Subjects that already have a generated course. One query instead of
+    /// `plan_for_stack` per row per frame.
+    pub fn stacks_with_plans(&self) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare("SELECT tech_stack_id FROM plans")?;
+        let rows = stmt
+            .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -837,6 +845,15 @@ impl Db {
             |r| r.get(0),
         )?)
     }
+}
+
+/// One row of the cross-subject progress table.
+pub struct SubjectProgress {
+    pub name: String,
+    pub days_done: i64,
+    pub days_total: i64,
+    pub logged_minutes: i64,
+    pub target_hours: i64,
 }
 
 pub const SCHEMA: &str = r#"
@@ -1007,7 +1024,7 @@ mod course_pipeline {
 
         // 1. The CLI builds the course.
         let cfg = CliConfig::default();
-        let prompt = mentor::prompt_plan("Redis", 2, 60);
+        let prompt = mentor::prompt_plan("Redis", 2, 60, &[]);
         let raw = mentor::run_cli(&cfg, &prompt, None).expect("claude CLI ran");
         let slice = mentor::extract_json(&raw).expect("JSON in the reply");
         let mut plan: PlanJson = serde_json::from_str(slice).expect("plan parses");
@@ -1037,7 +1054,10 @@ mod course_pipeline {
         let reloaded = db.days_for_plan(plan_id).expect("days reload");
         let first = &reloaded[0];
         println!("lesson is {} chars", first.content_md.len());
-        println!("--- first 400 chars ---\n{}", &first.content_md.chars().take(400).collect::<String>());
+        println!(
+            "--- first 400 chars ---\n{}",
+            first.content_md.chars().take(400).collect::<String>()
+        );
         assert!(
             first.content_md.len() > 500,
             "the stored lesson has real content, got {} chars",

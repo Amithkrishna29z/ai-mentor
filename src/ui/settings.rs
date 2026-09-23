@@ -126,8 +126,19 @@ pub fn show(app: &mut AiMentorApp, ctx: &egui::Context) {
                 if ui.add(save).clicked() {
                     app.apply_settings();
                 }
-                if ui.button("Test Claude CLI").clicked() {
-                    test_cli(app);
+                if ui
+                    .add_enabled(!app.testing_cli, egui::Button::new("Test Claude CLI"))
+                    .clicked()
+                {
+                    app.test_cli(crate::mentor::CliConfig {
+                        claude_path: app.settings_form.claude_path.clone(),
+                        prompt_flag: app.settings_form.prompt_flag.clone(),
+                        extra_args: app.settings_form.extra_args.clone(),
+                        git_path: app.settings_form.git_path.clone(),
+                    });
+                }
+                if app.testing_cli {
+                    ui.spinner();
                 }
             });
 
@@ -226,19 +237,3 @@ fn updates_section(app: &mut AiMentorApp, ui: &mut egui::Ui) {
     }
 }
 
-/// A cheap round-trip so a misconfigured path surfaces before a long job.
-fn test_cli(app: &mut AiMentorApp) {
-    let cfg = crate::mentor::CliConfig {
-        claude_path: app.settings_form.claude_path.clone(),
-        prompt_flag: app.settings_form.prompt_flag.clone(),
-        extra_args: app.settings_form.extra_args.clone(),
-        git_path: app.settings_form.git_path.clone(),
-    };
-    match crate::mentor::run_cli(&cfg, "Reply with the single word: ready", None) {
-        Ok(out) => {
-            app.status = format!("CLI replied: {}", out.trim().chars().take(60).collect::<String>());
-            app.error = None;
-        }
-        Err(e) => app.error = Some(e.to_string()),
-    }
-}

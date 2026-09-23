@@ -247,7 +247,7 @@ fn issue_list(app: &mut AiMentorApp, ui: &mut egui::Ui, issues: &[Issue]) {
 
     let filtered: Vec<&Issue> = issues
         .iter()
-        .filter(|i| app.issue_filter == "all" || i.severity.eq_ignore_ascii_case(&app.issue_filter))
+        .filter(|i| app.issue_filter == "all" || severity_bucket(&i.severity) == app.issue_filter)
         .collect();
 
     if filtered.is_empty() {
@@ -270,7 +270,7 @@ fn issue_list(app: &mut AiMentorApp, ui: &mut egui::Ui, issues: &[Issue]) {
             });
             ui.label(&issue.issue);
             if !issue.suggestion.is_empty() {
-                ui.label(egui::RichText::new(format!("→ {}", issue.suggestion)).weak());
+                ui.label(egui::RichText::new(format!("» {}", issue.suggestion)).weak());
             }
         });
     }
@@ -287,10 +287,21 @@ fn verdict_color(verdict: &str, t: &theme::Theme) -> egui::Color32 {
     }
 }
 
+/// Canonical bucket for a severity, matching the filter buttons. The prompt
+/// asks for "high|med|low" but the reviewer often answers "medium", and both
+/// spellings have to reach the same filter and the same colour.
+fn severity_bucket(severity: &str) -> &'static str {
+    match severity.trim().to_ascii_lowercase().as_str() {
+        "high" => "high",
+        "med" | "medium" => "med",
+        _ => "low",
+    }
+}
+
 fn severity_color(severity: &str, t: &theme::Theme) -> egui::Color32 {
-    match severity.to_ascii_lowercase().as_str() {
+    match severity_bucket(severity) {
         "high" => t.critical,
-        "med" | "medium" => t.serious,
+        "med" => t.serious,
         _ => t.warning,
     }
 }

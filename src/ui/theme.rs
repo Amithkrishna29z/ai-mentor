@@ -15,6 +15,9 @@ const fn rgb(hex: u32) -> Color32 {
     )
 }
 
+// A complete design-token set: the palette stays whole even where a view does
+// not reach for a token yet.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub struct Theme {
     pub dark: bool,
