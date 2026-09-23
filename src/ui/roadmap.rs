@@ -44,6 +44,8 @@ pub fn show(app: &mut AiMentorApp, ui: &mut egui::Ui) {
         .weak(),
     );
     ui.add_space(8.0);
+    target_job(app, ui);
+    ui.add_space(8.0);
     next_up(app, ui, &progress);
     ui.add_space(8.0);
     ui.separator();
@@ -137,6 +139,78 @@ pub fn show(app: &mut AiMentorApp, ui: &mut egui::Ui) {
 
     ui.separator();
     add_controls(app, ui, active.id);
+}
+
+/// The job being trained for. Paste a real posting and the track is rebuilt
+/// from the skills it asks for, in the order the posting says to learn them.
+fn target_job(app: &mut AiMentorApp, ui: &mut egui::Ui) {
+    let t = theme::current(ui);
+    theme::card(ui, |ui| {
+        ui.horizontal(|ui| {
+            theme::section_label(ui, "Target job");
+            let role = app.target_role.trim().to_string();
+            if role.is_empty() {
+                theme::chip(ui, "none set");
+            } else {
+                theme::pill(ui, role, t.accent);
+                let seniority = app.target_seniority.trim().to_string();
+                if !seniority.is_empty() {
+                    theme::chip(ui, seniority);
+                }
+            }
+            if app.reading_job {
+                ui.spinner();
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "Paste a real posting. The skills it asks for become your track, in the \
+                 order to learn them, and every course from then on is written for that role.",
+            )
+            .size(11.5)
+            .color(t.text_muted),
+        );
+        ui.add_space(6.0);
+
+        let header = if app.target_role.trim().is_empty() {
+            "Paste a job posting"
+        } else {
+            "Use a different posting"
+        };
+        egui::CollapsingHeader::new(header)
+            .id_salt("jd_box")
+            .default_open(app.target_role.trim().is_empty())
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut app.jd_input)
+                        .hint_text("The whole posting - responsibilities and requirements")
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(6),
+                );
+                ui.add_space(5.0);
+                ui.horizontal(|ui| {
+                    let build = egui::Button::new(
+                        egui::RichText::new("Build my track from this job")
+                            .color(egui::Color32::WHITE)
+                            .strong(),
+                    )
+                    .fill(t.accent)
+                    .corner_radius(egui::CornerRadius::same(8));
+                    if ui.add_enabled(!app.reading_job, build).clicked() {
+                        app.read_job_description();
+                    }
+                    if ui.button("Clear").clicked() {
+                        app.jd_input.clear();
+                    }
+                    ui.label(
+                        egui::RichText::new("Replaces the track, not your courses.")
+                            .size(11.0)
+                            .color(t.text_muted),
+                    );
+                });
+            });
+    });
 }
 
 /// The one thing the track is for: what to work on now, and one click to get

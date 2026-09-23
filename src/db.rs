@@ -549,6 +549,15 @@ impl Db {
         Ok(())
     }
 
+    /// Drop every subject from a roadmap, for rebuilding it from a posting.
+    pub fn clear_roadmap_items(&self, roadmap_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM roadmap_items WHERE roadmap_id = ?1",
+            params![roadmap_id],
+        )?;
+        Ok(())
+    }
+
     pub fn remove_roadmap_item(&self, item_id: i64) -> Result<()> {
         self.conn
             .execute("DELETE FROM roadmap_items WHERE id = ?1", params![item_id])?;
@@ -1024,7 +1033,7 @@ mod course_pipeline {
 
         // 1. The CLI builds the course.
         let cfg = CliConfig::default();
-        let prompt = mentor::prompt_plan("Redis", 2, 60, &[]);
+        let prompt = mentor::prompt_plan("Redis", 2, 60, &[], "");
         let raw = mentor::run_cli(&cfg, &prompt, None).expect("claude CLI ran");
         let slice = mentor::extract_json(&raw).expect("JSON in the reply");
         let mut plan: PlanJson = serde_json::from_str(slice).expect("plan parses");

@@ -8,7 +8,7 @@ use egui_commonmark::CommonMarkCache;
 use crate::db::{self, Db};
 use crate::mentor::{self, CliConfig, JobResult};
 use crate::models::*;
-use crate::{quiz, roadmap, srs, timer, ui, verify};
+use crate::{job, quiz, roadmap, srs, timer, ui, verify};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -50,12 +50,10 @@ pub enum StudyView {
 /// launching twenty processes at once.
 pub enum QueuedJob {
     Plan {
-        stack_id: i64,
-        tech: String,
-        target_hours: i64,
-        minutes_per_day: i64,
-        /// Subjects already cleared earlier on the track.
-        builds_on: Vec<String>,
+        request: mentor::PlanRequest,
+    },
+    JobSkills {
+        description: String,
     },
     DayContent {
         day_id: i64,
@@ -129,6 +127,11 @@ pub struct AiMentorApp {
     pub project_notes_buffer: String,
     pub minutes_input: i64,
     pub custom_subject: String,
+    /// The job the learner is training for, and the posting box on the track.
+    pub target_role: String,
+    pub target_seniority: String,
+    pub jd_input: String,
+    pub reading_job: bool,
     pub new_roadmap_name: String,
     pub github_input: String,
     pub issue_filter: String,
@@ -192,6 +195,8 @@ impl AiMentorApp {
         let max_concurrent = db.setting_i64("max_concurrent_cli", 1).clamp(1, 4) as usize;
         let auto_fetch_lessons = db.setting_or("auto_fetch_lessons", "1") == "1";
         let last_subject = db.get_setting("last_subject").and_then(|s| s.parse().ok());
+        let target_role = db.setting_or("target_role", "");
+        let target_seniority = db.setting_or("target_seniority", "");
         let stacks = db.all_stacks().unwrap_or_default();
 
         let mut app = Self {
@@ -222,6 +227,10 @@ impl AiMentorApp {
             project_notes_buffer: String::new(),
             minutes_input: 60,
             custom_subject: String::new(),
+            target_role,
+            target_seniority,
+            jd_input: String::new(),
+            reading_job: false,
             new_roadmap_name: String::new(),
             github_input: String::new(),
             issue_filter: "all".to_string(),
@@ -283,6 +292,9 @@ impl AiMentorApp {
         self.days.clear();
         self.projects.clear();
         self.verifications.clear();
+        // The track does not depend on the selected subject, and this returns
+        // early when nothing is selected - as on a fresh install.
+        self.reload_track();
         let Some(stack_id) = self.active_stack else {
             return;
         };
@@ -300,7 +312,6 @@ impl AiMentorApp {
         }
         self.sync_day_buffers();
         self.reload_verifications();
-        self.reload_track();
     }
 
     pub fn reload_due_cards(&mut self) {
@@ -378,21 +389,12 @@ impl AiMentorApp {
                 return;
             };
             match job {
-                QueuedJob::Plan {
-                    stack_id,
-                    tech,
-                    target_hours,
-                    minutes_per_day,
-                    builds_on,
-                } => mentor::spawn_plan(
-                    self.tx.clone(),
-                    self.cfg.clone(),
-                    stack_id,
-                    tech,
-                    target_hours,
-                    minutes_per_day,
-                    builds_on,
-                ),
+                QueuedJob::Plan { request } => {
+                    mentor::spawn_plan(self.tx.clone(), self.cfg.clone(), request)
+                }
+                QueuedJob::JobSkills { description } => {
+                    mentor::spawn_job_skills(self.tx.clone(), self.cfg.clone(), description)
+                }
                 QueuedJob::DayContent { day_id, prompt } => {
                     mentor::spawn_day_content(self.tx.clone(), self.cfg.clone(), day_id, prompt)
                 }
@@ -473,14 +475,15 @@ impl AiMentorApp {
             if matches!(self.db.plan_for_stack(id), Ok(Some(_))) {
                 continue; // keep existing plans; use Regenerate to replace one
             }
-            let builds_on = self.track_context(id);
-            self.queue.push_back(QueuedJob::Plan {
+            let request = mentor::PlanRequest {
+                builds_on: self.track_context(id),
+                role: self.target_role.clone(),
                 stack_id: id,
                 tech: name,
                 target_hours,
                 minutes_per_day,
-                builds_on,
-            });
+            };
+            self.queue.push_back(QueuedJob::Plan { request });
             launched += 1;
         }
         self.pump_queue();
@@ -492,14 +495,15 @@ impl AiMentorApp {
     }
 
     pub fn regenerate_plan(&mut self, stack_id: i64, tech: String) {
-        let job = QueuedJob::Plan {
+        let request = mentor::PlanRequest {
+            builds_on: self.track_context(stack_id),
+            role: self.target_role.clone(),
             stack_id,
             tech: tech.clone(),
             target_hours: self.settings_form.target_hours,
             minutes_per_day: self.settings_form.minutes_per_day,
-            builds_on: self.track_context(stack_id),
         };
-        self.enqueue(job);
+        self.enqueue(QueuedJob::Plan { request });
         self.status = format!("Generating the {tech} course…");
     }
 
@@ -516,6 +520,145 @@ impl AiMentorApp {
             Some(idx) => progress.cleared_before(idx),
             None => Vec::new(),
         }
+    }
+
+    /// The active roadmap's id, if there is one.
+    fn active_roadmap(&self) -> Option<i64> {
+        self.db
+            .roadmaps()
+            .ok()?
+            .into_iter()
+            .find(|r| r.active)
+            .map(|r| r.id)
+    }
+
+    /// Ticking a subject puts it on the track; unticking takes it off. The
+    /// checkbox and track membership are the same idea, so they stay in step -
+    /// a topic picked up mid-study lands at the end of the track and inherits
+    /// the chaining, rather than sitting outside the plan.
+    pub fn set_on_track(&mut self, stack_id: i64, on: bool) {
+        if let Err(e) = self.db.set_stack_selected(stack_id, on) {
+            self.error = Some(e.to_string());
+            return;
+        }
+        let Some(roadmap_id) = self.active_roadmap() else {
+            self.reload_stacks();
+            return;
+        };
+        let name = self
+            .stacks
+            .iter()
+            .find(|s| s.id == stack_id)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+
+        if on {
+            let _ = self.db.add_roadmap_item(roadmap_id, stack_id);
+            self.status = format!("{name} added to the end of your track.");
+        } else {
+            if let Ok(items) = self.db.roadmap_items(roadmap_id) {
+                if let Some(item) = items.iter().find(|i| i.tech_stack_id == stack_id) {
+                    let _ = self.db.remove_roadmap_item(item.id);
+                }
+            }
+            // The course and its days survive; only the track entry goes.
+            self.status = format!("{name} taken off your track.");
+        }
+        self.reload_stacks();
+    }
+
+    /// Read a pasted job posting and rebuild the track from what it asks for.
+    pub fn read_job_description(&mut self) {
+        let description = self.jd_input.trim().to_string();
+        if description.len() < 40 {
+            self.status = "Paste the job posting first.".to_string();
+            return;
+        }
+        if self.reading_job {
+            return;
+        }
+        self.reading_job = true;
+        self.enqueue(QueuedJob::JobSkills { description });
+        self.status = "Reading the posting for the skills it asks for…".to_string();
+    }
+
+    /// Turn an extracted posting into a track: match each skill onto a subject
+    /// the app can teach, invent one where it cannot, and lay them out in the
+    /// order the posting says to learn them.
+    fn build_track_from_job(&mut self, spec: &JobSpecJson) {
+        let role = spec.role.trim();
+        if !role.is_empty() {
+            self.target_role = role.to_string();
+            let _ = self.db.set_setting("target_role", role);
+        }
+        self.target_seniority = spec.seniority.trim().to_string();
+        let _ = self
+            .db
+            .set_setting("target_seniority", &self.target_seniority.clone());
+
+        let known: Vec<String> = self.db
+            .all_stacks()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+
+        let mut skills = spec.skills.clone();
+        skills.sort_by_key(|s| s.priority);
+
+        let mut wanted: Vec<i64> = Vec::new();
+        let mut matched = 0usize;
+        let mut invented = 0usize;
+        for skill in &skills {
+            let stack_id = match job::match_subject(&skill.name, &known) {
+                Some(name) => {
+                    matched += 1;
+                    self.db.stack_id_by_name(&name).ok().flatten()
+                }
+                None => {
+                    let name = job::custom_subject_name(&skill.name);
+                    if name.is_empty() {
+                        continue;
+                    }
+                    invented += 1;
+                    self.db.add_custom_stack(&name).ok()
+                }
+            };
+            if let Some(id) = stack_id {
+                if !wanted.contains(&id) {
+                    wanted.push(id);
+                }
+            }
+        }
+        if wanted.is_empty() {
+            self.error = Some("That posting did not name any studiable skills.".to_string());
+            return;
+        }
+
+        // The posting defines its own track, so it gets its own roadmap rather
+        // than overwriting the preset.
+        let track_name = if role.is_empty() {
+            "Job track".to_string()
+        } else {
+            format!("{role} (job track)")
+        };
+        let Ok(roadmap_id) = self.db.create_roadmap(&track_name) else {
+            self.error = Some("Could not create the job track.".to_string());
+            return;
+        };
+        let _ = self.db.clear_roadmap_items(roadmap_id);
+        for id in &wanted {
+            let _ = self.db.add_roadmap_item(roadmap_id, *id);
+            let _ = self.db.set_stack_selected(*id, true);
+        }
+        let _ = self.db.set_active_roadmap(roadmap_id);
+
+        self.reload_stacks();
+        self.tab = Tab::Roadmap;
+        self.status = format!(
+            "{track_name}: {} subjects ({matched} known, {invented} added).",
+            wanted.len()
+        );
     }
 
     /// Move to whatever the track says comes next: select that subject, and
@@ -892,6 +1035,16 @@ impl AiMentorApp {
                                 format!("AI Mentor {} is up to date.", crate::update::current_version());
                         }
                         Err(e) => self.error = Some(format!("Update check failed: {e}")),
+                    }
+                }
+                JobResult::JobSkills { outcome } => {
+                    self.reading_job = false;
+                    match outcome {
+                        Ok(spec) => self.build_track_from_job(&spec),
+                        Err(e) => {
+                            self.error = Some(e);
+                            self.status = "Could not read that posting.".to_string();
+                        }
                     }
                 }
                 JobResult::CliTest { outcome } => {
@@ -1293,6 +1446,150 @@ pub fn status_color(status: DayStatus, t: &ui::theme::Theme) -> egui::Color32 {
         DayStatus::NotStarted => t.text_muted,
         DayStatus::InProgress => t.accent,
         DayStatus::Done => t.good,
+    }
+}
+
+/// A posting has to come out the other side as an ordered, studiable track.
+#[cfg(test)]
+mod job_track {
+    use super::*;
+
+    fn app() -> (tempfile::TempDir, AiMentorApp) {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let db = Db::open_at(&tmp.path().join("t.db")).expect("db opens");
+        db.set_setting("check_updates_on_start", "0").expect("setting");
+        (tmp, AiMentorApp::new(db))
+    }
+
+    fn skill(name: &str, priority: i64) -> JobSkillJson {
+        JobSkillJson {
+            name: name.to_string(),
+            priority,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_posting_becomes_a_track_in_the_order_it_asks_for() {
+        let (_tmp, mut app) = app();
+        app.build_track_from_job(&JobSpecJson {
+            role: "Java Backend Developer".to_string(),
+            seniority: "junior".to_string(),
+            skills: vec![
+                skill("Java 17", 1),
+                skill("Spring Boot 3.x", 2),
+                skill("Postgres", 3),
+                skill("gRPC", 4), // nothing in the catalogue teaches this
+            ],
+        });
+
+        assert_eq!(app.target_role, "Java Backend Developer");
+        assert_eq!(app.target_seniority, "junior");
+
+        let entries = &app.track.as_ref().expect("a track was built").entries;
+        let subjects: Vec<&str> = entries.iter().map(|e| e.subject.as_str()).collect();
+        assert_eq!(
+            subjects,
+            vec!["Java", "Spring Boot", "PostgreSQL", "gRPC"],
+            "matched to the catalogue where possible, invented where not, in posting order"
+        );
+
+        for name in ["Java", "Spring Boot", "PostgreSQL", "gRPC"] {
+            let id = app.db.stack_id_by_name(name).unwrap().unwrap();
+            assert!(
+                app.stacks.iter().any(|s| s.id == id && s.selected),
+                "{name} is ticked, so the track and the checkboxes agree"
+            );
+        }
+    }
+
+    #[test]
+    fn the_posting_track_is_its_own_roadmap_and_leaves_the_preset_alone() {
+        let (_tmp, mut app) = app();
+        let before = app.db.roadmaps().unwrap().len();
+
+        app.build_track_from_job(&JobSpecJson {
+            role: "React Developer".to_string(),
+            skills: vec![skill("React", 1), skill("TypeScript", 2)],
+            ..Default::default()
+        });
+
+        let after = app.db.roadmaps().unwrap();
+        assert_eq!(after.len(), before + 1, "a new roadmap, not an overwrite");
+        let active = after.iter().find(|r| r.active).expect("one is active");
+        assert_eq!(active.name, "React Developer (job track)");
+        assert!(
+            after.iter().any(|r| r.is_preset && !r.active),
+            "the preset survives, just inactive"
+        );
+    }
+
+    #[test]
+    fn a_posting_with_nothing_studiable_is_refused_rather_than_wiping_the_track() {
+        let (_tmp, mut app) = app();
+        let roadmaps_before = app.db.roadmaps().unwrap().len();
+
+        app.build_track_from_job(&JobSpecJson {
+            role: "Vibes Engineer".to_string(),
+            skills: vec![skill("   ", 1)],
+            ..Default::default()
+        });
+
+        assert!(app.error.is_some(), "it says so");
+        assert_eq!(app.db.roadmaps().unwrap().len(), roadmaps_before);
+    }
+
+    /// A real posting does this: it listed both "Java 17" and "Java
+    /// Collections", which are one subject here.
+    #[test]
+    fn two_skills_naming_the_same_subject_make_one_track_entry() {
+        let (_tmp, mut app) = app();
+        app.build_track_from_job(&JobSpecJson {
+            role: "Java Backend Engineer".to_string(),
+            skills: vec![
+                skill("Java 17", 1),
+                skill("Java Collections", 2),
+                skill("Spring Boot 3", 3),
+            ],
+            ..Default::default()
+        });
+
+        let subjects: Vec<&str> = app
+            .track
+            .as_ref()
+            .expect("a track")
+            .entries
+            .iter()
+            .map(|e| e.subject.as_str())
+            .collect();
+        assert_eq!(
+            subjects,
+            vec!["Java", "Spring Boot"],
+            "Java appears once, at the position it was first asked for"
+        );
+    }
+
+    #[test]
+    fn ticking_a_subject_mid_study_appends_it_to_the_track() {
+        let (_tmp, mut app) = app();
+        let before = app.track.as_ref().expect("preset track").entries.len();
+        let redis = app.db.stack_id_by_name("Redis").unwrap().unwrap();
+
+        app.set_on_track(redis, true);
+        let entries = &app.track.as_ref().unwrap().entries;
+        assert_eq!(entries.len(), before + 1);
+        assert_eq!(
+            entries.last().unwrap().subject,
+            "Redis",
+            "a topic picked up later lands at the end, behind what is already underway"
+        );
+
+        app.set_on_track(redis, false);
+        assert_eq!(
+            app.track.as_ref().unwrap().entries.len(),
+            before,
+            "unticking takes it back off"
+        );
     }
 }
 
